@@ -442,12 +442,12 @@ class VisualPotentialField:
                  c0l       = -0.85,  # left  lane marking (m)       ← adapted
                  c2_str    = 0.005,  # c2 straight road             (Table I)
                  c2_cur    = 5e-6,   # c2 curved road               (Table I)
-                 # ── FIX-2 : hard boundary parameters ──────────────────────
-                 bnd_k     = 8.0,    # peak exponential gain at the wall
-                 bnd_sigma = 0.18,   # exponential decay distance (m)
-                 bnd_onset = 0.30,   # distance from wall where force begins (m) - reduced for early activation
-                 # ── FIX-3 : lane-centre restoring force ───────────────────
-                 ctr_k     = 0.50):  # proportional gain toward y = 0 - increased for stronger centering
+                 # ── FIX-2 : hard boundary parameters - AGGRESSIVE for safety ──
+                 bnd_k     = 15.0,   # peak exponential gain at the wall - increased
+                 bnd_sigma = 0.12,   # exponential decay distance (m) - tightened for crisp response
+                 bnd_onset = 0.15,   # distance from wall where force begins (m) - very early activation
+                 # ── FIX-3 : lane-centre restoring force - VERY STRONG ─────────
+                 ctr_k     = 1.00):  # proportional gain toward y = 0 - doubled for aggressive centering
         self.alpha     = alpha
         self.gamma     = gamma
         self.road_A    = road_A
@@ -615,20 +615,21 @@ class VisualPotentialField:
             effective_k ≈ ctr_k  (moderate - don't fight the avoidance)
 
         When rep_mag is small (open road):
-            effective_k ≈ ctr_k * (1 + boost) = up to 3x stronger
-            -> car is pulled firmly back to y = 0 between obstacles.
+            effective_k ≈ ctr_k * (1 + boost) = up to 4x stronger
+            -> car is pulled very firmly back to y = 0 between obstacles.
 
-        This is the key to recentring: once the car clears an obstacle and
-        F_rep drops, centering suddenly dominates and smoothly steers back
-        to centre BEFORE the next obstacle is encountered.
+        This is the key to robust recentring: once the car clears an obstacle and
+        F_rep drops, centering suddenly dominates and strongly steers back
+        to centre BEFORE approaching the next obstacle.
 
         Sign convention: Fy = -effective_k * y
           y > 0 (left of centre)  -> Fy < 0  -> push right toward centre
           y < 0 (right of centre) -> Fy > 0  -> push left  toward centre
         """
-        # boost decays from 2.0 to 0 as rep_mag rises above ~0.005
+        # boost decays from 3.0 to 0 as rep_mag rises above ~0.008
         # (rep_mag approx 0 on open road; rep_mag grows to ~0.02-0.08 near obstacle)
-        boost        = 2.0 * math.exp(-rep_mag / 0.006)
+        # Higher boost multiplier ensures center-seeking is very aggressive on open road
+        boost        = 3.0 * math.exp(-rep_mag / 0.008)
         effective_k  = self.ctr_k * (1.0 + boost)
         return np.array([0.0, -effective_k * veh_y])
 
@@ -645,8 +646,8 @@ def compute_desired_heading(F_att     : np.ndarray,
                              psi       : float,
                              lam_X     : float = 0.15,
                              lam_Y     : float = 0.15,
-                             lam_bnd   : float = 1.20,
-                             lam_ctr   : float = 1.00) -> float:
+                             lam_bnd   : float = 1.50,   # increased for strong boundary enforcement
+                             lam_ctr   : float = 1.80) -> float:  # increased for strong centering
     """
     Combine image-plane and motion-plane forces into a global desired heading.
 
@@ -727,11 +728,11 @@ class GTSMC:
 
     def __init__(self,
                  cr        = 3.5,                   # FIX-1: raised from 2.5
-                 u0        = 0.22,                  # FIX-1: reduced further to prevent oversteering
+                 u0        = 0.16,                  # FIX-1: reduced to 0.16 to minimize overshoot
                  cl        = 1.0,
                  a0        = 1.5,
-                 v_ref     = 5.55,                  # ~20 km/h  (Table II)
-                 delta_max = math.radians(22)):      # FIX-1: lowered from 40°
+                 v_ref     = 4.50,                  # reduced to 16 km/h for safer maneuvers
+                 delta_max = math.radians(15)):      # reduced from 22 deg for tighter control
         self.cr        = cr
         self.u0        = u0
         self.cl        = cl
