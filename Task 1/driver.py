@@ -1,4 +1,5 @@
 """
+visual_potential_field_nav.py
 
 Full implementation of:
     "Optical Flow based Visual Potential Field for Autonomous Driving"
@@ -10,18 +11,19 @@ setup_simulation() helper provided by that module; all pipeline logic
 (Sections III – VI) is provided.
 
 Behaviour improvements over the base implementation
-         Softer steering
+────────────────────────────────────────────────────
+  FIX-1  Softer steering
          GTSMC: u0 1.0 → 0.40, delta_max 40° → 22°, cr raised to 3.5.
          EMA low-pass filter applied to both psi_d and delta_f so that
          noisy optical-flow frames do not cause abrupt wheel snaps.
 
-         Hard boundary repulsion  (boundary_force)
+  FIX-2  Hard boundary repulsion  (boundary_force)
          Exponential wall force that activates within 0.55 m of the road
          edges (±1.16 m) and grows steeply as the car approaches the wall.
          Added with its own gain lam_bnd in compute_desired_heading so it
          ALWAYS overrides obstacle or road forces near the edge.
 
-         Lane-centre re-centring  (centering_force)
+  FIX-3  Lane-centre re-centring  (centering_force)
          Gentle proportional pull toward y = 0 whenever the car is off
          centre.  Deliberately weak (ctr_k = 0.25) so it does not fight
          active obstacle avoidance, but provides a clear restoring bias
@@ -75,6 +77,7 @@ class SimulationEnvironment:
       • Front-mounted monocular camera (640×480, FOV 60°)
       • get_state() / apply_bicycle_control() / step() / disconnect()
 
+    All pipeline code in sections 2-10 is unchanged from the original.
 
     Road geometry (from simulation_setup.py):
       Road half-width  = 1.16 m
@@ -93,30 +96,30 @@ class SimulationEnvironment:
     WHEEL_RADIUS = 0.18   # (m)  used to convert m/s → rad/s
 
     def __init__(self, gui: bool = True):
-        
+        # ── Author's scene initialisation 
         # setup_simulation() calls p.connect(), sets gravity/timestep,
         # loads the plane, builds the road, spawns the racecar, and runs
         # 60 settle frames so suspension reaches equilibrium before we start.
         self.car_id, self.steering_joints, self.motor_joints = \
             setup_simulation(dt=1.0 / 60.0, settle_frames=60, gui=gui)
 
-        
+        # ── Camera debug view
         p.resetDebugVisualizerCamera(
             cameraDistance=8, cameraPitch=-20, cameraYaw=180,
             cameraTargetPosition=[5, 0, 0]
         )
 
-        
+        # ── Goal marker (green sphere near end wall)
         self.goal_world = np.array([29.0, 0.0, 0.35])
         gv = p.createVisualShape(p.GEOM_SPHERE, radius=0.5,
                                  rgbaColor=[0.1, 0.9, 0.1, 0.8])
         p.createMultiBody(0, -1, gv, self.goal_world.tolist())
 
-        # Lane boundary references (world y, used by road potential field)
+        # ── Lane boundary references (world y, used by road potential field)
         self.lane_left_y  =  1.16   # left  road edge (m)
         self.lane_right_y = -1.16   # right road edge (m)
 
-    # Camera
+    # ── Camera
     def capture_frame(self):
         """
         Returns (bgr_frame, view_matrix, proj_matrix).
@@ -161,7 +164,7 @@ class SimulationEnvironment:
             return (u, v)
         return None
 
-    # Vehicle state
+    # ── Vehicle state
     def get_state(self):
         pos, orn = p.getBasePositionAndOrientation(self.car_id)
         vel, _   = p.getBaseVelocity(self.car_id)
@@ -173,7 +176,7 @@ class SimulationEnvironment:
             'speed': float(np.linalg.norm(vel[:2])),
         }
 
-    # Bicycle kinematic model control (Eq. 22-26) 
+    # ── Bicycle kinematic model control (Eq. 22-26)
     def apply_bicycle_control(self, delta_f: float, speed: float):
         """
         Translates the bicycle-model outputs (Eq. 22-26) into PyBullet
@@ -216,7 +219,7 @@ class SimulationEnvironment:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2.  SPARSE OPTICAL FLOW  (Section III)
-#     Shi-Tomasi corners + scratch-implemented Pyramidal Lucas-Kanade tracker
+#     Shi-Tomasi corners + our manual Pyramidal Lucas-Kanade tracker
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SparseOpticalFlow:
@@ -243,7 +246,7 @@ class SparseOpticalFlow:
         self._prev_gray  = None
         self._prev_pts   = None   # ndarray (N, 2) float32 – [x, y] pixel positions
 
-    # Corner detection
+    # ── Corner detection
     def _detect(self, gray: np.ndarray) -> np.ndarray:
         c = cv2.goodFeaturesToTrack(gray,
                                     maxCorners=self.max_corners,
@@ -252,7 +255,7 @@ class SparseOpticalFlow:
         return c.reshape(-1, 2).astype(np.float32) if c is not None \
                else np.empty((0, 2), np.float32)
 
-    # Main compute
+    # ── Main compute
     def compute(self, gray: np.ndarray):
         """
         Feed the next grayscale frame.
@@ -381,7 +384,7 @@ def compute_obstacle_gradient(flows, img_h: int, img_w: int):
 
     Returns (g_x, g_y) gradient arrays, each (img_h, img_w) float32.
     """
-    #Step 1: scatter flow magnitudes onto a sparse image
+    # --- Step 1: scatter flow magnitudes onto a sparse image
     mag_img = np.zeros((img_h, img_w), np.float32)
     for (x, y, vx, vy) in flows:
         ix = int(np.clip(x, 0, img_w - 1))
@@ -392,19 +395,19 @@ def compute_obstacle_gradient(flows, img_h: int, img_w: int):
         return (np.zeros((img_h, img_w), np.float32),
                 np.zeros((img_h, img_w), np.float32))
 
-    # Step 2: Otsu threshold → obstacle binary mask O
+    # --- Step 2: Otsu threshold → obstacle binary mask O
     mag_u8 = cv2.normalize(mag_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     _, O_bin = cv2.threshold(mag_u8, 0, 255,
                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     O = O_bin.astype(np.float32) / 255.0
 
-    # Step 3: G * O  (σ = half image width, Eq. 4) 
+    # --- Step 3: G * O  (σ = half image width, Eq. 4)
     sigma = img_w / 2.0
     ksize = int(6 * sigma) | 1
     ksize = min(ksize, min(img_w, img_h) - 1) | 1
     GO = cv2.GaussianBlur(O, (ksize, ksize), sigma)
 
-    # Step 4: gradient of G*O  (Eq. 6)
+    # --- Step 4: gradient of G*O  (Eq. 6) 
     g_x = cv2.Sobel(GO, cv2.CV_32F, 1, 0, ksize=3)
     g_y = cv2.Sobel(GO, cv2.CV_32F, 0, 1, ksize=3)
     return g_x, g_y
@@ -483,7 +486,7 @@ class VisualPotentialField:
         return np.array([F_mag * math.cos(theta),
                           F_mag * math.sin(theta)])
 
-    # ── IV-B : Obstacle repulsive force  (Eq. 9)
+    # ── IV-B : Obstacle repulsive force  (Eq. 9) 
     def repulsive_force(self,
                         g_x: np.ndarray,
                         g_y: np.ndarray,
@@ -790,7 +793,7 @@ class GTSMC:
                                + (1.0 - self.ALPHA_STEER) * self._delta_f_filt)
         self._prev_psi_e = psi_e
 
-        # ── Longitudinal (Eq. 31-32)
+        # ── Longitudinal (Eq. 31-32) 
         s_l         = self.cl * speed - self.v_ref
         a           = -self.a0 * math.copysign(1.0, s_l)
         self._speed = float(np.clip(self._speed + a * dt, 0.5, self.v_ref * 1.2))
@@ -907,7 +910,7 @@ class VisualNavigator:
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             h, w = gray.shape
 
-            # ── Step 2 : Sparse optical flow  (Sec. III) 
+            # ── Step 2 : Sparse optical flow  (Sec. III)
             flows = self.of.compute(gray)
 
             # ── Step 3 : FOE  (Sec. III-A, Eq. 1-3)
@@ -922,7 +925,7 @@ class VisualNavigator:
             # ── Step 6 : Project goal into image
             goal_img = self.env.project_to_image(self.env.goal_world, vm, pm)
 
-            # ── Step 7 : Visual Potential Field forces  (Sec. IV) 
+            # ── Step 7 : Visual Potential Field forces  (Sec. IV)
             F_att  = self.vpf.attractive_force(goal_img, w, h)
             F_rep  = self.vpf.repulsive_force(g_x, g_y, ttcs, h, w)
             rep_mag = float(np.linalg.norm(F_rep))
@@ -959,7 +962,7 @@ class VisualNavigator:
             )
             psi_d = self._psi_d_filt
 
-            # ── Step 9 : GTSMC  (Sec. VI, Eq. 28-32)
+            # ── Step 9 : GTSMC  (Sec. VI, Eq. 28-32) 
             now = time.time()
             dt  = now - self._t0
             self._t0 = now
@@ -968,11 +971,11 @@ class VisualNavigator:
                 state['yaw'], psi_d, state['speed'], dt
             )
 
-            # ── Step 10 : Apply control to racecar joints  (Eq. 22-26)
+            # ── Step 10 : Apply control to racecar joints  (Eq. 22-26) 
             self.env.apply_bicycle_control(delta_f, speed)
             self.env.step()
 
-            # ── Step 11 : Visualise
+            # ── Step 11 : Visualise 
             debug = draw_debug(
                 frame_bgr.copy(), flows,
                 foe_x, foe_y, goal_img,
