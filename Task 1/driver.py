@@ -1,977 +1,820 @@
 """
-visual_potential_field_nav.py
+optical_flow_controller.py
 
 Full implementation of:
-    "Optical Flow based Visual Potential Field for Autonomous Driving"
-    Capito, Ozguner, Redmill – IEEE Intelligent Vehicles Symposium, 2020
+  "Optical Flow based Visual Potential Field for Autonomous Driving"
+  Capito, Ozguner, Redmill — IV 2020
 
-This version uses the author-supplied simulation_setup.py directly.
-The SimulationEnvironment class is now a thin adapter around the
-setup_simulation() helper provided by that module; all pipeline logic
-(Sections III – VI) is provided.
+Pipeline (per frame pair It, It+1):
+  1.  Capture RGB frames from PyBullet windshield camera
+  2.  Detect Shi-Tomasi corners on It  (cv2 allowed for detection)
+  3.  Sparse LK optical flow — our hand-rolled LucasKanadeTracker
+  4.  Focus of Expansion (FOE) via least-squares  (Eq. 1-2, Sec. III-A)
+  5.  TTC per tracked point  (Eq. 3,  Sec. III-B)
+  6.  Obstacle map Ot via Otsu → Gaussian G*Ot → gradient g(x,y,t) (Eq. 4-6)
+  7.  Obstacle repulsive force F_rep  (Eq. 9,  Sec. IV-B)
+  8.  Attractive force F_att          (Eq. 7-8, Sec. IV-A)
+  9.  Road potential field Us          (Eq. 10-17, Sec. IV-C)
+      → Road repulsive force F_reprd  (Eq. 18)
+  10. Total force in global coords    (Eq. 19-21, Sec. V)
+  11. Desired heading ψ_d             (Eq. 27,    Sec. VI)
+  12. Gradient-Tracking Sliding Mode Controller:
+        Lateral  — rotational manifold s_r  (Eq. 28-30)
+        Longitudinal — s_l                 (Eq. 31-32)
 
-Behaviour improvements over the base implementation
-────────────────────────────────────────────────────
-  FIX-1  Softer steering
-         GTSMC: u0 1.0 → 0.40, delta_max 40° → 22°, cr raised to 3.5.
-         EMA low-pass filter applied to both psi_d and delta_f so that
-         noisy optical-flow frames do not cause abrupt wheel snaps.
-
-  FIX-2  Hard boundary repulsion  (boundary_force)
-         Exponential wall force that activates within 0.55 m of the road
-         edges (±1.16 m) and grows steeply as the car approaches the wall.
-         Added with its own gain lam_bnd in compute_desired_heading so it
-         ALWAYS overrides obstacle or road forces near the edge.
-
-  FIX-3  Lane-centre re-centring  (centering_force)
-         Gentle proportional pull toward y = 0 whenever the car is off
-         centre.  Deliberately weak (ctr_k = 0.25) so it does not fight
-         active obstacle avoidance, but provides a clear restoring bias
-         once the obstacle is cleared.
-
-Pipeline (one frame):
-    capture → Shi-Tomasi + Pyramidal LK  (Sec. III)
-            → FOE via least-squares       (Sec. III-A, Eq. 1-3)
-            → TTC per tracked point       (Sec. III-B, Eq. 3)
-            → Obstacle map + gradient     (Sec. III-C, Eq. 4-6)
-            → Attractive force            (Sec. IV-A,  Eq. 7-8)
-            → Repulsive force             (Sec. IV-B,  Eq. 9)
-            → Road potential field        (Sec. IV-C,  Eq. 10-18)
-            → Boundary repulsion          (FIX-2)
-            → Lane-centre pull            (FIX-3)
-            → Total force → psi_d         (Sec. V,     Eq. 19-21, 27)
-            → EMA-smoothed psi_d          (FIX-1)
-            → GTSMC steering + speed      (Sec. VI,    Eq. 28-32)
-            → EMA-smoothed delta_f        (FIX-1)
-            → PyBullet racecar control    (Sec. VI-A,  Eq. 22-26)
+Usage:
+    python optical_flow_controller.py
 """
 
-import math
-import time
-import numpy as np
 import cv2
+import numpy as np
 import pybullet as p
-import pybullet_data
+import time
+import math
 
-from lucaskanade import LucasKanadeTracker          # manual Pyramidal LK
-from simulation_setup import setup_simulation        # ← author-supplied module
+from simulation_setup import setup_simulation
+from lucaskanade import LucasKanadeTracker
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TUNEABLE CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Image / camera
+IMG_W      = 640
+IMG_H      = 480
+FOV_DEG    = 60
+NEAR_CLIP  = 0.05
+FAR_CLIP   = 20.0
+
+# LK sparse flow
+LK_LEVELS  = 3      # pyramid levels  (paper uses 3)
+LK_WIN     = 15     # window size     (paper uses 25; 15 suits our resolution)
+MAX_CORNERS = 150
+QUAL_LVL    = 0.01
+MIN_DIST    = 10    # minimum pixel distance between Shi-Tomasi features
+
+# APF gains
+ALPHA      = 0.6    # attractive gain  α
+GAMMA      = 2.5    # obstacle repulsive gain  γ
+LAMBDA_X   = 0.4    # road-force weight in X  λX
+LAMBDA_Y   = 0.4    # road-force weight in Y  λY
+
+# Road Morse potential (Table I)
+APF_A        = 0.5
+APF_B        = 1.0
+C2_STRAIGHT  = 0.005
+C2_CURVED    = 5e-6
+C1           = 0.0
+DELTA_X      = 1.0e-10   # small offset to avoid /0 at x=0  (Eq. 16)
+
+# Road geometry — simulation lane markings at ±0.85 m
+Y_RIGHT      =  0.85   # right lane boundary yr  [m]
+Y_LEFT       = -0.85   # left  lane boundary yl  [m]
+
+# GTSMC gains (Sec. VI)
+CR           = 3.0    # rotational manifold gain
+CL           = 1.0    # longitudinal manifold gain
+U0           = 0.8    # max steering rate  [rad/s]
+A0           = 0.4    # max acceleration magnitude  [m/s²]
+V_DES        = 3.0    # desired speed  [m/s]  (~11 km/h)
+
+# Steering smoothing (Fix 1 & 4)
+S_R_SAT        = 0.3            # manifold saturation threshold [rad] — proportional zone
+MAX_DELTA_DOT  = math.radians(30)  # max steering rate [rad/s] — prevents oscillation
+
+# Road force centering bias gain (Fix 3)
+Y_CENTER_GAIN  = 0.3            # proportional pull back to y=0
+
+# FOE low-pass filter coefficient (Fix 2)
+FOE_ALPHA      = 0.05           # small → slow filter, ignores transient controller turns
+
+# Physics
+DT           = 1.0 / 60.0
+MAX_STEER    = math.radians(40)   # ±40° steering limit
+MOTOR_FORCE  = 800
+
+# Goal (end of slalom road)
+X_GOAL = 31.0
+Y_GOAL =  0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1.  SIMULATION ENVIRONMENT  (adapter around author's simulation_setup.py)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SPARSE OPTICAL FLOW ENGINE  (wraps our LucasKanadeTracker)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class SimulationEnvironment:
+class SparseFlowEngine:
     """
-    Thin adapter that wraps setup_simulation() from the author's module.
-
-    setup_simulation() handles:
-      • p.connect() / gravity / timestep
-      • Flat road with lane markings (33.3 m long, ±1.16 m half-width)
-      • Five yellow/black slalom obstacles at x = 6, 12, 18, 24 m
-      • End wall at x ≈ 31.7 m
-      • Racecar URDF (globalScaling = 1.8) at the origin
-
-    This class adds:
-      • Goal-sphere visual marker
-      • Front-mounted monocular camera (640×480, FOV 60°)
-      • get_state() / apply_bicycle_control() / step() / disconnect()
-
-    All pipeline code in sections 2-10 is unchanged from the original.
-
-    Road geometry (from simulation_setup.py):
-      Road half-width  = 1.16 m
-      Lane markings at y = 0, ±0.85 m
-    The road potential-field offsets c0r / c0l in VisualPotentialField are
-    set to ±0.85 m to align with these markings (see Section 6 below).
-    """
-
-    CAM_W    = 640
-    CAM_H    = 480
-    CAM_FOV  = 60.0
-    CAM_NEAR = 0.1
-    CAM_FAR  = 100.0
-
-    # Racecar wheel radius:  stock ~0.1 m × globalScaling 1.8 = 0.18 m
-    WHEEL_RADIUS = 0.18   # (m)  used to convert m/s → rad/s
-
-    def __init__(self, gui: bool = True):
-        # ── Author's scene initialisation ─────────────────────────────────
-        # setup_simulation() calls p.connect(), sets gravity/timestep,
-        # loads the plane, builds the road, spawns the racecar, and runs
-        # 60 settle frames so suspension reaches equilibrium before we start.
-        self.car_id, self.steering_joints, self.motor_joints = \
-            setup_simulation(dt=1.0 / 60.0, settle_frames=60, gui=gui)
-
-        # ── Camera debug view ─────────────────────────────────────────────
-        p.resetDebugVisualizerCamera(
-            cameraDistance=8, cameraPitch=-20, cameraYaw=180,
-            cameraTargetPosition=[5, 0, 0]
-        )
-
-        # ── Goal marker (green sphere near end wall) ──────────────────────
-        self.goal_world = np.array([29.0, 0.0, 0.35])
-        gv = p.createVisualShape(p.GEOM_SPHERE, radius=0.5,
-                                 rgbaColor=[0.1, 0.9, 0.1, 0.8])
-        p.createMultiBody(0, -1, gv, self.goal_world.tolist())
-
-        # ── Lane boundary references (world y, used by road potential field)
-        self.lane_left_y  =  1.16   # left  road edge (m)
-        self.lane_right_y = -1.16   # right road edge (m)
-
-    # ── Camera ────────────────────────────────────────────────────────────────
-    def capture_frame(self):
-        """
-        Returns (bgr_frame, view_matrix, proj_matrix).
-        Camera eye is 0.7 m ahead of and 0.3 m above the vehicle centre.
-        """
-        pos, orn = p.getBasePositionAndOrientation(self.car_id)
-        R = np.array(p.getMatrixFromQuaternion(orn)).reshape(3, 3)
-
-        eye    = np.array(pos) + R @ np.array([0.7, 0.0, 0.3])
-        target = eye + R @ np.array([1.0, 0.0, 0.0])
-
-        vm = p.computeViewMatrix(eye.tolist(), target.tolist(), [0, 0, 1])
-        pm = p.computeProjectionMatrixFOV(
-            self.CAM_FOV, self.CAM_W / self.CAM_H,
-            self.CAM_NEAR, self.CAM_FAR
-        )
-        _, _, rgba, _, _ = p.getCameraImage(
-            self.CAM_W, self.CAM_H, vm, pm,
-            renderer=p.ER_TINY_RENDERER
-        )
-        bgr = cv2.cvtColor(
-            np.array(rgba, np.uint8).reshape(self.CAM_H, self.CAM_W, 4)[:, :, :3],
-            cv2.COLOR_RGB2BGR
-        )
-        return bgr, vm, pm
-
-    def project_to_image(self, world_pt, view_matrix, proj_matrix):
-        """
-        Project a 3-D world point to (u, v) pixel coords using the camera MVP.
-        Returns None if the point is behind the camera or outside the frame.
-        """
-        vm = np.array(view_matrix).reshape(4, 4).T
-        pm = np.array(proj_matrix).reshape(4, 4).T
-        ph = np.array([*world_pt, 1.0], np.float64)
-        clip = pm @ vm @ ph
-        if abs(clip[3]) < 1e-8 or clip[2] < 0:
-            return None
-        ndc = clip[:3] / clip[3]
-        u = int((ndc[0] + 1.0) * 0.5 * self.CAM_W)
-        v = int((1.0 - ndc[1]) * 0.5 * self.CAM_H)
-        if 0 <= u < self.CAM_W and 0 <= v < self.CAM_H:
-            return (u, v)
-        return None
-
-    # ── Vehicle state ─────────────────────────────────────────────────────────
-    def get_state(self):
-        pos, orn = p.getBasePositionAndOrientation(self.car_id)
-        vel, _   = p.getBaseVelocity(self.car_id)
-        yaw      = p.getEulerFromQuaternion(orn)[2]
-        return {
-            'pos'  : np.array(pos),
-            'yaw'  : yaw,
-            'vel'  : np.array(vel),
-            'speed': float(np.linalg.norm(vel[:2])),
-        }
-
-    # ── Bicycle kinematic model control (Eq. 22-26) ───────────────────────────
-    def apply_bicycle_control(self, delta_f: float, speed: float):
-        """
-        Translates the bicycle-model outputs (Eq. 22-26) into PyBullet
-        joint commands for the racecar URDF.
-
-        Steering joints → POSITION_CONTROL with target angle delta_f.
-        Motor joints    → VELOCITY_CONTROL  with target wheel angular
-                          velocity  ω = speed / WHEEL_RADIUS  (rad/s).
-
-        The racecar URDF exposes the same steering/motor joint lists that
-        setup_simulation() already discovered and stored in
-        self.steering_joints / self.motor_joints.
-        """
-        # Lateral (Eq. 25 → steer angle)
-        for j in self.steering_joints:
-            p.setJointMotorControl2(
-                self.car_id, j,
-                p.POSITION_CONTROL,
-                targetPosition=delta_f,
-                force=10.0
-            )
-
-        # Longitudinal (Eq. 26 → wheel speed)
-        wheel_vel = speed / self.WHEEL_RADIUS     # m/s → rad/s
-        for j in self.motor_joints:
-            p.setJointMotorControl2(
-                self.car_id, j,
-                p.VELOCITY_CONTROL,
-                targetVelocity=wheel_vel,
-                force=800.0
-            )
-
-    def step(self):
-        p.stepSimulation()
-        time.sleep(1.0 / 240.0)
-
-    def disconnect(self):
-        p.disconnect()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2.  SPARSE OPTICAL FLOW  (Section III)
-#     Shi-Tomasi corners + our manual Pyramidal Lucas-Kanade tracker
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class SparseOpticalFlow:
-    """
-    Implements the optical flow block described in Section III:
-      1. Convert to grayscale
-      2. Detect corners with Shi-Tomasi (cv2.goodFeaturesToTrack)
-      3. Track with Pyramidal LK (our LucasKanadeTracker)
-         Paper params: window=(25,25), 3 pyramid levels, eps=0.03
+    Produces a list of (tracked-point, flow-vector) pairs from two consecutive
+    grayscale frames.  Feature detection uses cv2.goodFeaturesToTrack (Shi-Tomasi,
+    which is the algorithm specified in the paper Sec. III).  The actual optical
+    flow computation uses our hand-rolled LucasKanadeTracker exclusively.
     """
 
-    def __init__(self,
-                 lk_win      = 25,
-                 lk_levels   = 3,
-                 max_corners = 200,
-                 quality     = 0.01,
-                 min_dist    = 10):
-        self.lk          = LucasKanadeTracker(num_pyramid_levels=lk_levels,
-                                               num_iterations=1)
-        self.lk_win      = lk_win
-        self.max_corners = max_corners
-        self.quality     = quality
-        self.min_dist    = min_dist
-        self._prev_gray  = None
-        self._prev_pts   = None   # ndarray (N, 2) float32 – [x, y] pixel positions
+    def __init__(self):
+        self.tracker = LucasKanadeTracker(
+            num_pyramid_levels=LK_LEVELS,
+            num_iterations=5
+        )
 
-    # ── Corner detection ──────────────────────────────────────────────────────
     def _detect(self, gray: np.ndarray) -> np.ndarray:
-        c = cv2.goodFeaturesToTrack(gray,
-                                    maxCorners=self.max_corners,
-                                    qualityLevel=self.quality,
-                                    minDistance=self.min_dist)
-        return c.reshape(-1, 2).astype(np.float32) if c is not None \
-               else np.empty((0, 2), np.float32)
-
-    # ── Main compute ──────────────────────────────────────────────────────────
-    def compute(self, gray: np.ndarray):
         """
-        Feed the next grayscale frame.
-        Returns list of (x, y, vx, vy) for every successfully tracked point.
+        Shi-Tomasi corner detection.
+        Returns (N, 2) array of [col, row] float positions, or empty (0,2).
         """
-        if self._prev_gray is None or len(self._prev_pts) == 0:
-            self._prev_gray = gray
-            self._prev_pts  = self._detect(gray)
-            return []
+        pts = cv2.goodFeaturesToTrack(
+            gray,
+            maxCorners=MAX_CORNERS,
+            qualityLevel=QUAL_LVL,
+            minDistance=MIN_DIST
+        )
+        if pts is None:
+            return np.empty((0, 2), dtype=np.float32)
+        return pts.reshape(-1, 2)   # (N, [col, row])
 
-        h, w = gray.shape
-        half = self.lk_win // 2
-        flows, next_pts = [], []
+    def compute(self, gray1: np.ndarray, gray2: np.ndarray):
+        """
+        Compute sparse flow It → It+1.
 
-        for (px, py) in self._prev_pts:
-            col = int(np.clip(px - half, 0, w - self.lk_win - 1))
-            row = int(np.clip(py - half, 0, h - self.lk_win - 1))
+        Parameters
+        ----------
+        gray1, gray2 : uint8 grayscale images (H × W)
 
-            vel = self.lk.pyramidal_lucas_kanade(
-                self._prev_gray.astype(np.float64),
-                gray.astype(np.float64),
-                row, col, self.lk_win
-            )
-            if vel is None:
-                continue
+        Returns
+        -------
+        pts   : (N, 2) float  pixel positions (col=x, row=y) of tracked features
+        flows : (N, 2) float  (vx, vy) optical flow vector per feature
+        valid : (N,)   bool   True for points that produced a usable flow vector
+        """
+        f1 = gray1.astype(np.float64)
+        f2 = gray2.astype(np.float64)
 
-            vx, vy = float(vel[0, 0]), float(vel[1, 0])
-            mag    = math.hypot(vx, vy)
+        pts = self._detect(gray1)
+        if len(pts) == 0:
+            return (np.empty((0, 2), dtype=np.float32),
+                    np.empty((0, 2), dtype=np.float32),
+                    np.empty(0, dtype=bool))
 
-            if mag < 0.05 or mag > 40.0:
-                continue
+        flows = np.zeros_like(pts)
+        valid = np.zeros(len(pts), dtype=bool)
 
-            nx, ny = px + vx, py + vy
-            if 0 <= nx < w and 0 <= ny < h:
-                flows.append((float(px), float(py), vx, vy))
-                next_pts.append([nx, ny])
+        half = LK_WIN // 2
+        h, w = gray1.shape
 
-        if len(next_pts) < 20:
-            self._prev_pts = self._detect(gray)
-        else:
-            self._prev_pts = np.array(next_pts, np.float32)
+        for i, (col, row) in enumerate(pts):
+            # Anchor the window top-left corner, clamped inside the image
+            r = int(np.clip(int(row) - half, 0, h - LK_WIN - 1))
+            c = int(np.clip(int(col) - half, 0, w - LK_WIN - 1))
 
-        self._prev_gray = gray
-        return flows   # [(x, y, vx, vy), ...]
+            # Our pyramidal LK returns a (2,1) velocity [vx; vy]
+            vel = self.tracker.pyramidal_lucas_kanade(f1, f2, r, c, LK_WIN)
 
-    def reset(self):
-        self._prev_gray = None
-        self._prev_pts  = None
+            vx = float(vel[0, 0])
+            vy = float(vel[1, 0])
+            mag = math.hypot(vx, vy)
+
+            # Accept only vectors with sensible magnitude
+            if 1e-3 < mag < 80.0:
+                flows[i] = [vx, vy]
+                valid[i] = True
+
+        return pts, flows, valid
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3.  FOCUS OF EXPANSION  (Section III-A, Eq. 1-3)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC. III-A  —  FOCUS OF EXPANSION  (Eq. 1-2)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def compute_foe(flows, img_w: int, img_h: int):
+def compute_foe(pts: np.ndarray, flows: np.ndarray, valid: np.ndarray):
     """
-    FOE via least-squares.  Each flow vector (vx, vy) at pixel (x, y)
-    defines the constraint that the FOE lies on the line through (x,y)
-    in direction (vx, vy):
+    Least-squares FOE.
 
-        vy * (xF - x) - vx * (yF - y) = 0
-        ⟹  [vy  -vx] [xF  yF]^T  =  x*vy - y*vx
+    For each tracked point p_i(x, y) with flow (vx, vy):
+        a_i0 = vy,    a_i1 = -vx,    b_i = x*vy - y*vx    (Eq. 1-2)
 
-    Building A (rows = [a_i0, a_i1] = [vy_i, -vx_i]) and
-              b (rows = b_i = x_i*vy_i - y_i*vx_i),
-    the closed-form least-squares solution is (Eq. 1-3):
+    FOE = (A^T A)^{-1} A^T b
 
-        FOE = (A^T A)^{-1} A^T b
-
-    Expanded (paper's explicit form):
-        D    = Σa₀² · Σa₁² - (Σa₀a₁)²
-        xFOE = (Σa₀b · Σa₁² - Σa₁b · Σa₀a₁) / D
-        yFOE = (−Σa₀b · Σa₀a₁ + Σa₁b · Σa₀²) / D
+    Returns (xFOE, yFOE) in image-plane pixel coords.
+    Falls back to image centre when fewer than 4 valid points.
     """
-    if len(flows) < 4:
-        return img_w / 2.0, img_h / 2.0
+    idx = np.where(valid)[0]
+    if len(idx) < 4:
+        return float(IMG_W / 2), float(IMG_H / 2)
 
-    a0 = np.array([ f[3]                   for f in flows], np.float64)  # vy
-    a1 = np.array([-f[2]                   for f in flows], np.float64)  # -vx
-    b  = np.array([f[0]*f[3] - f[1]*f[2]  for f in flows], np.float64)  # x·vy − y·vx
+    x  = pts[idx, 0].astype(np.float64)   # image-plane x (col)
+    y  = pts[idx, 1].astype(np.float64)   # image-plane y (row)
+    vx = flows[idx, 0].astype(np.float64)
+    vy = flows[idx, 1].astype(np.float64)
 
-    Sa0b = float(np.dot(a0, b))
-    Sa1b = float(np.dot(a1, b))
-    Sa02 = float(np.dot(a0, a0))
-    Sa12 = float(np.dot(a1, a1))
-    Sa01 = float(np.dot(a0, a1))
+    a0 =  vy          # a_i0 column
+    a1 = -vx          # a_i1 column
+    b  = x * vy - y * vx
 
-    D = Sa02 * Sa12 - Sa01 ** 2
-    if abs(D) < 1e-9:
-        return img_w / 2.0, img_h / 2.0
+    A_mat = np.stack([a0, a1], axis=1)   # (N, 2)
+    ATA   = A_mat.T @ A_mat              # (2, 2)
+    ATb   = A_mat.T @ b                  # (2,)
 
-    foe_x = (Sa0b * Sa12 - Sa1b * Sa01) / D
-    foe_y = (-Sa0b * Sa01 + Sa1b * Sa02) / D
-    return float(foe_x), float(foe_y)
+    try:
+        foe = np.linalg.solve(ATA, ATb)
+        xf  = float(np.clip(foe[0], -IMG_W, 2 * IMG_W))
+        yf  = float(np.clip(foe[1], -IMG_H, 2 * IMG_H))
+        return xf, yf
+    except np.linalg.LinAlgError:
+        return float(IMG_W / 2), float(IMG_H / 2)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4.  TIME TO CONTACT  (Section III-B, Eq. 3)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC. III-B  —  TIME TO CONTACT  (Eq. 3)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def compute_ttc(flows, foe_x: float, foe_y: float):
+def compute_ttc(pts, flows, valid, xFOE, yFOE):
     """
-    TTC_i = √[(x−xFOE)²+(y−yFOE)²] / √[vx²+vy²]   (Eq. 3)
+    TTC_i = sqrt((x - xFOE)^2 + (y - yFOE)^2) / sqrt(vx^2 + vy^2)   Eq.(3)
 
-    Returns a list of TTC values in the same order as `flows`.
-    Very slow flows get a large TTC (not a collision threat).
+    Returns (N,) array; np.inf for invalid / stationary points.
     """
-    ttcs = []
-    for (x, y, vx, vy) in flows:
-        dist_foe = math.hypot(x - foe_x, y - foe_y)
-        flow_mag = math.hypot(vx, vy)
-        ttcs.append(dist_foe / flow_mag if flow_mag > 1e-4 else 1e6)
-    return ttcs
+    ttc = np.full(len(pts), np.inf)
+    for i in range(len(pts)):
+        if not valid[i]:
+            continue
+        vmag = math.hypot(flows[i, 0], flows[i, 1])
+        if vmag > 1e-6:
+            dist     = math.hypot(pts[i, 0] - xFOE, pts[i, 1] - yFOE)
+            ttc[i]   = dist / vmag
+    return ttc
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5.  OBSTACLE DETECTION & GRADIENT FIELD  (Section III-C, Eq. 4-6)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC. III-C  —  OBSTACLE DETECTION  →  gradient field g(x,y,t)  (Eq. 4-6)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def compute_obstacle_gradient(flows, img_h: int, img_w: int):
+def compute_obstacle_gradient(pts, flows, valid, img_shape):
     """
-    Step 1 – Build a flow-magnitude image at tracked pixel positions.
-    Step 2 – Otsu threshold on that image → binary obstacle mask O(x,y,t).
-    Step 3 – Convolve O with a wide Gaussian G(x,y) with σ = img_w/2  (Eq. 4-5).
-    Step 4 – g(x,y,t) = ∇(G * O)  (Eq. 6), computed via Sobel on the blurred mask.
+    Steps
+    -----
+    1. Build a dense flow-magnitude image M from sparse tracked points.
+    2. Otsu threshold → binary obstacle map O_t(x,y)  (Sec. III-C).
+    3. Convolve with Gaussian G  (Eq. 4-5);  σ = IMG_W / 2  per paper.
+    4. ∇(G * O)  via Sobel  →  g(x,y,t)  (Eq. 6).
 
-    Returns (g_x, g_y) gradient arrays, each (img_h, img_w) float32.
+    Returns
+    -------
+    gx, gy : (H, W) float64  — x and y components of obstacle gradient
+    O_bin  : (H, W) uint8    — binary obstacle mask (for visualisation)
     """
-    # --- Step 1: scatter flow magnitudes onto a sparse image -----------------
-    mag_img = np.zeros((img_h, img_w), np.float32)
-    for (x, y, vx, vy) in flows:
-        ix = int(np.clip(x, 0, img_w - 1))
-        iy = int(np.clip(y, 0, img_h - 1))
-        mag_img[iy, ix] = max(mag_img[iy, ix], math.hypot(vx, vy))
+    H, W = img_shape
 
-    if mag_img.max() < 1e-4:
-        return (np.zeros((img_h, img_w), np.float32),
-                np.zeros((img_h, img_w), np.float32))
+    # Step 1 : scatter flow magnitudes onto a canvas
+    M = np.zeros((H, W), dtype=np.float32)
+    for i in range(len(pts)):
+        if not valid[i]:
+            continue
+        cx  = int(np.clip(pts[i, 0], 0, W - 1))
+        cy  = int(np.clip(pts[i, 1], 0, H - 1))
+        mag = math.hypot(flows[i, 0], flows[i, 1])
+        if mag > M[cy, cx]:
+            M[cy, cx] = mag
 
-    # --- Step 2: Otsu threshold → obstacle binary mask O --------------------
-    mag_u8 = cv2.normalize(mag_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    _, O_bin = cv2.threshold(mag_u8, 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    O = O_bin.astype(np.float32) / 255.0
+    # Dilate to cover the sparse point cloud
+    M = cv2.dilate(M, np.ones((7, 7), np.uint8))
 
-    # --- Step 3: G * O  (σ = half image width, Eq. 4) -----------------------
-    sigma = img_w / 2.0
-    ksize = int(6 * sigma) | 1
-    ksize = min(ksize, min(img_w, img_h) - 1) | 1
-    GO = cv2.GaussianBlur(O, (ksize, ksize), sigma)
+    # Step 2 : Otsu threshold on flow-magnitude image
+    M_u8 = np.clip(M * 10.0, 0, 255).astype(np.uint8)
+    _, O_bin = cv2.threshold(M_u8, 0, 255,
+                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # --- Step 4: gradient of G*O  (Eq. 6) -----------------------------------
-    g_x = cv2.Sobel(GO, cv2.CV_32F, 1, 0, ksize=3)
-    g_y = cv2.Sobel(GO, cv2.CV_32F, 0, 1, ksize=3)
-    return g_x, g_y
+    # Step 3 : Gaussian smoothing  (Eq. 4-5)
+    # Paper sets σ = half image width.  We cap the kernel to a practical size.
+    sigma  = W / 2.0
+    ksize  = int(6 * sigma) | 1          # round up to odd integer
+    ksize  = min(ksize, (min(H, W) - 1) | 1)
+    G_O    = cv2.GaussianBlur(O_bin.astype(np.float32), (ksize, ksize), sigma)
+
+    # Step 4 : gradient  ∇(G*O)  (Eq. 6)
+    gx = cv2.Sobel(G_O, cv2.CV_64F, 1, 0, ksize=5)
+    gy = cv2.Sobel(G_O, cv2.CV_64F, 0, 1, ksize=5)
+
+    return gx, gy, O_bin
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 6.  VISUAL POTENTIAL FIELD  (Section IV)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC. IV-A  —  ATTRACTIVE FORCE  (Eq. 7-8)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class VisualPotentialField:
+def compute_attractive_force(car_x, car_y, goal_x=X_GOAL, goal_y=Y_GOAL):
     """
-    Computes all three potential field force components:
-      IV-A  Attractive force      Eq. 7-8
-      IV-B  Obstacle repulsive    Eq. 9
-      IV-C  Road repulsive        Eq. 10-18  (Morse potential)
+    U_att = ½ α ‖p - p_goal‖                         Eq.(7)
+    F_att = ∇U_att = α * (p_goal - p) / ‖p_goal - p‖ Eq.(8)
 
-    Road-layout note:
-      The author's simulation_setup.py builds a single narrow road
-      (half-width = 1.16 m, lane markings at y = ±0.85 m).  To align
-      the Morse potential boundaries with the actual markings the offsets
-      c0r / c0l are set to ±0.85 m here (paper Table I uses ±5.25/−8.75 m
-      for a 14 m wide, four-lane CARLA highway).  All other parameters and
-      all equation logic are unchanged from the paper.
+    Returns (Fattx, Fatty) in motion-plane (X = forward, Y = lateral).
     """
-
-    def __init__(self,
-                 alpha     = 0.06,   # attractive gain              (tunable)
-                 gamma     = 3.0,    # obstacle repulsive gain      (tunable)
-                 road_A    = 0.5,    # Morse depth                  (Table I)
-                 road_b    = 1.0,    # Morse variance parameter     (Table I)
-                 c0r       =  0.85,  # right lane marking (m)       ← adapted
-                 c0l       = -0.85,  # left  lane marking (m)       ← adapted
-                 c2_str    = 0.005,  # c2 straight road             (Table I)
-                 c2_cur    = 5e-6,   # c2 curved road               (Table I)
-                 # ── FIX-2 : hard boundary parameters ──────────────────────
-                 bnd_k     = 8.0,    # peak exponential gain at the wall
-                 bnd_sigma = 0.18,   # exponential decay distance (m)
-                 bnd_onset = 0.30,   # distance from wall where force begins (m) - reduced for early activation
-                 # ── FIX-3 : lane-centre restoring force ───────────────────
-                 ctr_k     = 0.50):  # proportional gain toward y = 0 - increased for stronger centering
-        self.alpha     = alpha
-        self.gamma     = gamma
-        self.road_A    = road_A
-        self.road_b    = road_b
-        self.c0r       = c0r
-        self.c0l       = c0l
-        self.c2_str    = c2_str
-        self.c2_cur    = c2_cur
-        self.bnd_k     = bnd_k
-        self.bnd_sigma = bnd_sigma
-        self.bnd_onset = bnd_onset
-        self.ctr_k     = ctr_k
-
-    # ── IV-A : Attractive force  (Eq. 7-8) ───────────────────────────────────
-    def attractive_force(self, goal_img, img_w: int, img_h: int) -> np.ndarray:
-        """
-        The target potential is proportional to Euclidean distance from the
-        image centre to the projected goal pixel (Eq. 7).
-
-        F_att = α · dist,   directed toward goal  (Eq. 8)
-        θ_goal = atan2(y_goal − y_ctr, x_goal − x_ctr)
-
-        If the goal is off-screen we return zero lateral bias (drive straight).
-        """
-        cx, cy = img_w / 2.0, img_h / 2.0
-        if goal_img is None:
-            return np.array([self.alpha * 10.0, 0.0])
-
-        gx, gy = float(goal_img[0]), float(goal_img[1])
-        dist   = math.hypot(gx - cx, gy - cy)
-        if dist < 1.0:
-            return np.array([0.0, 0.0])
-
-        theta = math.atan2(gy - cy, gx - cx)
-        F_mag = self.alpha * dist
-        return np.array([F_mag * math.cos(theta),
-                          F_mag * math.sin(theta)])
-
-    # ── IV-B : Obstacle repulsive force  (Eq. 9) ──────────────────────────────
-    def repulsive_force(self,
-                        g_x: np.ndarray,
-                        g_y: np.ndarray,
-                        ttcs: list,
-                        img_h: int,
-                        img_w: int) -> np.ndarray:
-        """
-        F_rep = γ · (1/|R|) · [ ∫_A g(x,y,t) dx  /  Σ_A TTC_i ]   (Eq. 9)
-
-        In discrete form:
-            F_rep_x = γ · (1/N) · Σ g_x(x,y)  /  Σ TTC_i
-            F_rep_y = γ · (1/N) · Σ g_y(x,y)  /  Σ TTC_i
-
-        A low Σ TTC means things are approaching fast → strong repulsion.
-        """
-        if not ttcs:
-            return np.array([0.0, 0.0])
-
-        sum_ttc = max(sum(ttcs), 1e-4)
-        N       = float(img_h * img_w)
-
-        Fx = self.gamma * (float(g_x.sum()) / N) / sum_ttc
-        Fy = self.gamma * (float(g_y.sum()) / N) / sum_ttc
-        return np.array([Fx, Fy])
-
-    # ── IV-C : Road potential field force  (Eq. 10-18) ────────────────────────
-    def road_force(self,
-                   veh_x    : float,
-                   veh_y    : float,
-                   foe_img_x: float,
-                   img_w    : int) -> np.ndarray:
-        """
-        Modified Morse potential for lane-keeping  (Eq. 10-18).
-
-        The FOE image position (Sec. IV-C) decides straight vs curved:
-          |foe_norm| < 0.15  → straight  (c2 = 0.005, n = 1)
-          foe right          → curved right (c2 = +5e-6, n = 2)
-          foe left           → curved left  (c2 = −5e-6, n = 2)
-
-        Returns gradient of (Usr + Usl) w.r.t. vehicle_y as (0, Fy).
-        """
-        dx = 1.0e-10   # small longitudinal offset δx  (Table I)
-
-        foe_norm = (foe_img_x - img_w / 2.0) / (img_w / 2.0)   # [-1, 1]
-        if abs(foe_norm) < 0.15:
-            c2, n = self.c2_str, 1
-        elif foe_norm > 0:
-            c2, n = +self.c2_cur, 2
-        else:
-            c2, n = -self.c2_cur, 2
-
-        c1 = 0.0   # Table I
-
-        xd = veh_x + dx
-        yr = c2 * (xd ** n) + c1 * xd + self.c0r   # Eq. 14
-        yl = c2 * (xd ** n) + c1 * xd + self.c0l   # Eq. 15
-
-        denom_m = 2.0 * c2 * xd + c1
-        m  = -1.0 / denom_m if abs(denom_m) > 1e-8 else -1.0e8
-        by = yr - m * xd                             # Eq. 17
-
-        A = self.road_A
-        b = self.road_b
-        y = veh_y
-
-        def _Usr(yy):
-            """Right lane Morse potential  (Eq. 12)"""
-            inner_x = (yy - by) / m - xd if abs(m) > 1e-6 else 0.0
-            r2 = inner_x ** 2 + (yr - yy) ** 2
-            sgn = math.copysign(1.0, yy - yr)
-            return A * (1.0 - math.exp(-b * sgn * math.sqrt(max(r2, 1e-12)))) ** 2
-
-        def _Usl(yy):
-            """Left lane Morse potential  (Eq. 13)"""
-            inner_x = (yy - by) / m - xd if abs(m) > 1e-6 else 0.0
-            r2 = inner_x ** 2 + (yl - yy) ** 2
-            sgn = math.copysign(1.0, yy - yl)
-            return A * (1.0 - math.exp(b * sgn * math.sqrt(max(r2, 1e-12)))) ** 2
-
-        # F_reprd = ∇(Usr + Usl)  (Eq. 18) – numerical derivative w.r.t. y
-        dy = 1e-3
-        Fy = (_Usr(y + dy) + _Usl(y + dy) -
-              _Usr(y - dy) - _Usl(y - dy)) / (2.0 * dy)
-        return np.array([0.0, Fy])
-
-    # ── FIX-2 : Hard boundary repulsion ───────────────────────────────────────
-    def boundary_force(self, veh_y: float) -> np.ndarray:
-        """
-        Strict exponential repulsion from the physical road edges (±1.16 m).
-
-        Activates as soon as the car enters within `bnd_onset` metres of
-        either wall and grows exponentially toward bnd_k as the car
-        approaches the wall face.  This force is ADDED (not subtracted)
-        in compute_desired_heading so it always dominates near the edge.
-
-        Sign convention (world Y-axis, positive = left):
-          Near RIGHT wall (veh_y → −1.16): Fy > 0  →  push left
-          Near LEFT  wall (veh_y → +1.16): Fy < 0  →  push right
-        """
-        ROAD_HW = 1.16   # road half-width (m) — matches simulation_setup.py
-        Fy = 0.0
-
-        # Distance from each wall; positive means the car is still inside
-        dist_right = ROAD_HW + veh_y   # right wall at y = −1.16
-        dist_left  = ROAD_HW - veh_y   # left  wall at y = +1.16
-
-        # Right wall → push left (+Fy)
-        if dist_right < self.bnd_onset:
-            d = max(dist_right, 1e-4)
-            Fy += self.bnd_k * math.exp(-d / self.bnd_sigma)
-
-        # Left wall → push right (−Fy)
-        if dist_left < self.bnd_onset:
-            d = max(dist_left, 1e-4)
-            Fy -= self.bnd_k * math.exp(-d / self.bnd_sigma)
-
-        return np.array([0.0, Fy])
-
-    # ── FIX-3 : Lane-centre restoring force ───────────────────────────────────
-    def centering_force(self, veh_y: float) -> np.ndarray:
-        """
-        Gentle proportional attraction toward the lane centre (y = 0).
-
-        Active at all times but kept deliberately weak (ctr_k = 0.25) so
-        it does not fight active obstacle repulsion.  Once the car has
-        cleared an obstacle the centering bias is the dominant lateral
-        force and smoothly returns the car to y = 0 ready for the next
-        manoeuvre.
-
-        Sign convention: Fy = −ctr_k · y
-          y > 0 (left of centre)  → Fy < 0  → push right toward centre
-          y < 0 (right of centre) → Fy > 0  → push left  toward centre
-        """
-        return np.array([0.0, -self.ctr_k * veh_y])
+    dx   = goal_x - car_x
+    dy   = goal_y - car_y
+    dist = math.hypot(dx, dy)
+    if dist < 1e-4:
+        return 0.0, 0.0
+    return ALPHA * dx / dist, ALPHA * dy / dist
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 7.  TOTAL FORCE → DESIRED HEADING  (Section V, Eq. 19-21, 27)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC. IV-B  —  OBSTACLE REPULSIVE FORCE  (Eq. 9)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def compute_desired_heading(F_att     : np.ndarray,
-                             F_rep     : np.ndarray,
-                             F_road    : np.ndarray,
-                             F_boundary: np.ndarray,
-                             F_center  : np.ndarray,
-                             psi       : float,
-                             lam_X     : float = 0.15,
-                             lam_Y     : float = 0.15,
-                             lam_bnd   : float = 1.20,
-                             lam_ctr   : float = 0.60) -> float:
+def compute_obstacle_repulsive_force(gx, gy, pts, ttc, valid):
     """
-    Combine image-plane and motion-plane forces into a global desired heading.
+    F_rep = (γ / |R|) * (Σ_A g(p_i)) / (Σ_A TTC_i)     Eq.(9)
 
-    Image-plane total force  (Eq. 19-20, extended with FIX-2 and FIX-3):
-        F_XT = F_att_x − F_rep_x − λX · FX_road
-        F_YT = F_att_y − F_rep_y − λY · FY_road
-                       + λ_bnd · F_boundary_Y      (FIX-2: ADDED, not subtracted)
-                       + λ_ctr · F_center_Y         (FIX-3: ADDED, not subtracted)
+    |R| = total pixel count in region of interest.
 
-    The boundary and centering forces are motion-plane forces that are
-    ADDED to F_YT (positive sign) because:
-      • F_boundary_Y > 0 when near the right wall → should increase F_YT
-        (more leftward total force → turn left away from wall).  If it
-        were subtracted like F_road it would do the opposite.
-      • F_center_Y = −ctr_k·y, so when y < 0 (right of centre)
-        F_center_Y > 0 → ADDED → positive F_YT contribution → turns left
-        back toward centre.  Correct.
-
-    Both gains (lam_bnd, lam_ctr) are deliberately larger than lam_Y so
-    boundary safety and recentring dominate the Morse road term.
-
-    Rotate to global frame  (Eq. 21):
-        [F_X']   [ cos ψ   sin ψ ] [F_XT]
-        [F_Y'] = [−sin ψ   cos ψ ] [F_YT]
-
-    Desired heading  (Eq. 27):
-        ψ_d = atan2(F_Y', F_X')
+    Returns (Fx, Fy).
     """
-    F_XT = (  F_att[0]
-            - F_rep[0]
-            - lam_X * F_road[0]
-            + lam_bnd * F_boundary[0]
-            + lam_ctr * F_center[0])
+    H, W   = gx.shape
+    R      = float(H * W)
 
-    F_YT = (  F_att[1]
-            - F_rep[1]
-            - lam_Y * F_road[1]
-            + lam_bnd * F_boundary[1]
-            + lam_ctr * F_center[1])
+    sum_gx  = 0.0
+    sum_gy  = 0.0
+    sum_ttc = 0.0
 
-    cp, sp = math.cos(psi), math.sin(psi)
-    F_Xp  =  cp * F_XT + sp * F_YT
-    F_Yp  = -sp * F_XT + cp * F_YT
+    for i in range(len(pts)):
+        if not valid[i]:
+            continue
+        cx = int(np.clip(pts[i, 0], 0, W - 1))
+        cy = int(np.clip(pts[i, 1], 0, H - 1))
+        sum_gx  += gx[cy, cx]
+        sum_gy  += gy[cy, cx]
+        t        = ttc[i]
+        if np.isfinite(t):
+            sum_ttc += t
 
-    if abs(F_Xp) < 1e-8 and abs(F_Yp) < 1e-8:
-        return psi   # degenerate – hold current heading
+    if abs(sum_ttc) < 1e-9:
+        return 0.0, 0.0
 
-    return math.atan2(F_Yp, F_Xp)
+    Fx = GAMMA / R * (sum_gx / sum_ttc)
+    Fy = GAMMA / R * (sum_gy / sum_ttc)
+    return Fx, Fy
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 8.  GRADIENT TRACKING SLIDING MODE CONTROLLER  (Section VI, Eq. 28-32)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC. IV-C  —  ROAD POTENTIAL FIELD  (Eq. 10-18)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _boundary_positions(car_x, c2):
+    """
+    Compute yr(x) and yl(x) from Eq.(14-15).
+
+    yr = c2*(x+δx)^n + c1*(x+δx) + c0r
+    yl = c2*(x+δx)^n + c1*(x+δx) + c0l
+
+    n = 1 for straight, n = 2 for curved (not used here; straight track).
+    """
+    xd = car_x + DELTA_X
+    yr = c2 * xd + C1 * xd + Y_RIGHT
+    yl = c2 * xd + C1 * xd + Y_LEFT
+    return yr, yl
+
+
+def _morse_pair(car_y, yr, yl, car_x, c2):
+    """
+    Evaluate U_sr (Eq. 12) and U_sl (Eq. 13) at the given (car_x, car_y).
+
+    U_sr = A * (1 - exp(-b*sign(y-yr) * sqrt( ((y-by_r)/m - (x+δx))^2 + (yr-y)^2 )))^2
+    U_sl = A * (1 - exp( b*sign(y-yl) * sqrt( ((y-by_l)/m - (x+δx))^2 + (yl-y)^2 )))^2
+    """
+    xd = car_x + DELTA_X
+
+    # Slope of line perpendicular to lane centre  Eq.(16)
+    denom = 2.0 * c2 * xd + C1
+    if abs(denom) < 1e-12:
+        denom = 1e-12 if denom >= 0 else -1e-12
+    m = -1.0 / denom
+
+    # y-intercept of that perpendicular line  Eq.(17)
+    by_r = yr - m * xd
+    by_l = yl - m * xd
+
+    # ---- Right boundary  Eq.(12) ----
+    inner_r = math.sqrt(((car_y - by_r) / m - xd) ** 2 + (yr - car_y) ** 2)
+    sign_r  = math.copysign(1.0, car_y - yr)
+    U_sr    = APF_A * (1.0 - math.exp(-APF_B * sign_r * inner_r)) ** 2
+
+    # ---- Left boundary  Eq.(13) ----
+    inner_l = math.sqrt(((car_y - by_l) / m - xd) ** 2 + (yl - car_y) ** 2)
+    sign_l  = math.copysign(1.0, car_y - yl)
+    U_sl    = APF_A * (1.0 - math.exp( APF_B * sign_l * inner_l)) ** 2
+
+    return U_sr, U_sl
+
+
+# Module-level state for the FOE low-pass filter (Fix 2).
+# Keeps the road curvature estimate stable across frames.
+_foe_x_filtered = float(IMG_W / 2)
+
+
+def compute_road_repulsive_force(car_x, car_y, xFOE, img_cx=IMG_W / 2.0):
+    """
+    1. Low-pass filter xFOE so transient controller turns don't flip the
+       road curvature model (Fix 2).
+    2. Choose c2 from filtered FOE offset (straight vs curved, Sec. IV-C).
+    3. Evaluate Us = U_sr + U_sl  (Eq. 10-13).
+    4. Numerical gradient  F_reprd = ∇Us  (Eq. 18).
+    5. Add centering bias — gentle proportional pull toward y=0 (Fix 3).
+
+    Returns (FX_road, FY_road) in motion-plane coords.
+    """
+    global _foe_x_filtered
+
+    # Fix 2: exponential moving average on FOE x position.
+    # Only long-lived FOE shifts (genuine curves) affect c2.
+    _foe_x_filtered = (1.0 - FOE_ALPHA) * _foe_x_filtered + FOE_ALPHA * xFOE
+
+    foe_offset = _foe_x_filtered - img_cx
+    if abs(foe_offset) < 0.10 * IMG_W:
+        c2 = C2_STRAIGHT
+    elif foe_offset > 0:
+        c2 = C2_CURVED       # right curve
+    else:
+        c2 = -C2_CURVED      # left curve
+
+    yr,  yl  = _boundary_positions(car_x, c2)
+    U_sr, U_sl = _morse_pair(car_y, yr, yl, car_x, c2)
+    Us = U_sr + U_sl
+
+    eps = 1e-4
+
+    # ∂Us/∂y
+    yr_dy, yl_dy = _boundary_positions(car_x, c2)
+    U_sr_dy, U_sl_dy = _morse_pair(car_y + eps, yr_dy, yl_dy, car_x, c2)
+    FY_road = -((U_sr_dy + U_sl_dy) - Us) / eps
+
+    # ∂Us/∂x
+    yr_dx, yl_dx = _boundary_positions(car_x + eps, c2)
+    U_sr_dx, U_sl_dx = _morse_pair(car_y, yr_dx, yl_dx, car_x + eps, c2)
+    FX_road = -((U_sr_dx + U_sl_dx) - Us) / eps
+
+    # Fix 3: centering bias — always nudge toward y=0 proportionally.
+    # This fills the near-zero gradient zone at lane centre and prevents
+    # the car drifting and staying off-centre after an obstacle avoidance.
+    FY_road += Y_CENTER_GAIN * (-car_y)
+
+    return FX_road, FY_road
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC. V  —  TOTAL POTENTIAL FIELD  (Eq. 19-21)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_total_force(Fattx, Fatty,
+                        Frepx, Frepy,
+                        FX_road, FY_road,
+                        psi):
+    """
+    Vehicle (motion-plane) frame  Eq.(19-20):
+        FXT = Fattx - Frepx - λX * FX_road
+        FYT = Fatty - Frepy - λY * FY_road
+
+    Global frame  Eq.(21):
+        [FX0]   [ cosψ  sinψ ] [FXT]
+        [FY0] = [-sinψ  cosψ ] [FYT]
+
+    Returns (FX0, FY0).
+    """
+    FXT = Fattx - Frepx - LAMBDA_X * FX_road
+    FYT = Fatty - Frepy - LAMBDA_Y * FY_road
+
+    cp = math.cos(psi)
+    sp = math.sin(psi)
+    FX0 =  cp * FXT + sp * FYT
+    FY0 = -sp * FXT + cp * FYT
+    return FX0, FY0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC. VI  —  GRADIENT-TRACKING SLIDING MODE CONTROLLER  (Eq. 27-32)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class GTSMC:
     """
-    Lateral controller  (Eq. 28-30):
-        ψ_e       = ψ(t) − ψ_d(p)
-        s_r       = c_r · ψ_e + ψ̇_e          (rotational sliding manifold)
-        u         = −u₀ · sign(s_r)
-        δ̇_f       = u   →   δ_f += u · Δt
+    Gradient-Tracking Sliding Mode Controller (Sec. VI of paper).
 
-    Longitudinal controller  (Eq. 31-32):
-        s_l       = c_l · v − v_d             (longitudinal sliding manifold)
-        a         = −a₀ · sign(s_l)
-        v        += a · Δt
+    Fixes applied vs. original bang-bang formulation:
+      Fix 1 — Proportional-saturating steering rate replaces hard sign().
+               Proportional within ±S_R_SAT, saturates outside → smooth
+               small corrections, still decisive for large errors.
+      Fix 4 — Per-frame steering rate clamped to MAX_DELTA_DOT so rapid
+               force-vector jumps cannot slam the wheel to full lock.
 
-    FIX-1 changes vs. base:
-      • u0        : 1.0 → 0.40   slower steering rate, prevents over-shoot
-      • delta_max : 40° → 22°    tighter limit avoids rail-riding snaps
-      • cr        : 2.5 → 3.5    more manifold damping, reduces oscillation
-      • EMA α=0.30 applied to the raw delta_f before output so that frame-
-        to-frame noise in psi_d does not cause abrupt wheel jerks
+    Lateral:      rotational manifold s_r  (Eq. 28-30)
+    Longitudinal: manifold s_l             (Eq. 31-32)
     """
 
-    # EMA coefficient for delta_f smoothing (0 = frozen, 1 = no filter)
-    ALPHA_STEER = 0.30
+    def __init__(self):
+        self.delta_f   = 0.0   # current steering angle  [rad]
+        self.psi_prev  = 0.0   # heading from previous step (for ψ̇_e)
 
-    def __init__(self,
-                 cr        = 3.5,                   # FIX-1: raised from 2.5
-                 u0        = 0.22,                  # FIX-1: reduced further to prevent oversteering
-                 cl        = 1.0,
-                 a0        = 1.5,
-                 v_ref     = 5.55,                  # ~20 km/h  (Table II)
-                 delta_max = math.radians(22)):      # FIX-1: lowered from 40°
-        self.cr        = cr
-        self.u0        = u0
-        self.cl        = cl
-        self.a0        = a0
-        self.v_ref     = v_ref
-        self.delta_max = delta_max
-
-        self._delta_f      = 0.0
-        self._delta_f_filt = 0.0   # EMA-smoothed output  (FIX-1)
-        self._speed        = v_ref
-        self._prev_psi_e   = 0.0
-
-    @staticmethod
-    def _wrap(a: float) -> float:
-        """Wrap angle to (−π, π]."""
-        return (a + math.pi) % (2.0 * math.pi) - math.pi
-
-    def update(self, psi: float, psi_d: float,
-               speed: float, dt: float):
+    def step(self, FX0: float, FY0: float,
+             psi: float, speed: float, dt: float):
         """
-        Returns (delta_f_smoothed, speed) to send to the vehicle.
+        Parameters
+        ----------
+        FX0, FY0 : total force components in global frame
+        psi      : current yaw  [rad]
+        speed    : current speed  [m/s]
+        dt       : time-step  [s]
 
-        FIX-1: the raw integrator output is run through an EMA filter
-        before being returned so that noisy psi_d values from optical
-        flow do not cause abrupt steering snaps.
+        Returns
+        -------
+        delta_f : steering angle  [rad], clamped to ±MAX_STEER
+        accel   : normalised acceleration command ∈ [-1, 1]
         """
-        dt = max(dt, 1e-4)
+        # ── Desired heading  Eq.(27) ──────────────────────────────────────
+        if abs(FX0) < 1e-9 and abs(FY0) < 1e-9:
+            psi_d = psi               # no force → hold heading
+        else:
+            psi_d = math.atan2(FY0, FX0)
 
-        # ── Lateral (Eq. 28-30) ───────────────────────────────────────────
-        psi_e     = self._wrap(psi - psi_d)
-        psi_e_dot = (psi_e - self._prev_psi_e) / dt
-        s_r       = self.cr * psi_e + psi_e_dot           # Eq. 28
-        u         = -self.u0 * math.copysign(1.0, s_r)    # Eq. 30
+        # ── Heading error & its derivative ───────────────────────────────
+        psi_e     = psi - psi_d
+        psi_e     = (psi_e + math.pi) % (2.0 * math.pi) - math.pi  # wrap to [-π, π]
+        psi_dot_e = (psi - self.psi_prev) / dt
+        self.psi_prev = psi
 
-        # Integrate steering angle (raw)
-        self._delta_f = float(np.clip(self._delta_f + u * dt,
-                                       -self.delta_max, self.delta_max))
+        # ── Rotational manifold  Eq.(28) ─────────────────────────────────
+        s_r = CR * psi_e + psi_dot_e
 
-        # FIX-1: EMA low-pass on raw delta_f
-        self._delta_f_filt = (self.ALPHA_STEER * self._delta_f
-                               + (1.0 - self.ALPHA_STEER) * self._delta_f_filt)
-        self._prev_psi_e = psi_e
+        # ── Fix 1: proportional-saturating steering rate ──────────────────
+        # Original: u = -U0 * sign(s_r)  — bang-bang, causes oscillation.
+        # New:      u = -U0 * clip(s_r / S_R_SAT, -1, 1)
+        #   • |s_r| < S_R_SAT  → proportional, rate proportional to error
+        #   • |s_r| ≥ S_R_SAT  → saturated at ±U0, same as original but
+        #                         only when error is genuinely large
+        u_raw = -U0 * max(-1.0, min(1.0, s_r / S_R_SAT))
 
-        # ── Longitudinal (Eq. 31-32) ──────────────────────────────────────
-        s_l         = self.cl * speed - self.v_ref         # Eq. 31
-        a           = -self.a0 * math.copysign(1.0, s_l)  # Eq. 32
-        self._speed = float(np.clip(self._speed + a * dt, 0.5, self.v_ref * 1.5))
+        # ── Fix 4: rate-limit how fast the wheel can turn ────────────────
+        # Prevents force-vector discontinuities from slamming to full lock.
+        max_change   = MAX_DELTA_DOT * dt
+        u_limited    = max(-max_change, min(max_change, u_raw * dt))
+        self.delta_f = float(np.clip(self.delta_f + u_limited,
+                                     -MAX_STEER, MAX_STEER))
 
-        return self._delta_f_filt, self._speed
+        # ── Longitudinal manifold  Eq.(31) ───────────────────────────────
+        s_l   = CL * speed - V_DES
+
+        # ── Throttle/brake  Eq.(32):  a = -a0 · sign(s_l) ───────────────
+        accel = float(np.clip(-A0 * math.copysign(1.0, s_l), -1.0, 1.0))
+
+        return self.delta_f, accel
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 9.  DEBUG OVERLAY
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# CAMERA UTILITY
+# ─────────────────────────────────────────────────────────────────────────────
 
-def draw_debug(frame, flows, foe_x, foe_y, goal_img,
-               F_att, F_rep, F_road, F_boundary, F_center,
-               psi_d, delta_f, speed, veh_y):
-    h, w = frame.shape[:2]
-    cx, cy = w // 2, h // 2
+def get_camera_image(car_id):
+    """
+    Render a windshield-mounted front camera from PyBullet.
 
-    # Optical flow vectors (green)
-    for (x, y, vx, vy) in flows:
-        p1 = (int(x), int(y))
-        p2 = (int(x + vx * 6), int(y + vy * 6))
-        cv2.arrowedLine(frame, p1, p2, (0, 200, 0), 1,
-                        cv2.LINE_AA, tipLength=0.4)
-        cv2.circle(frame, p1, 2, (0, 200, 0), -1)
+    The camera is positioned 0.5 m forward and 0.4 m above the car base,
+    looking 3 m ahead and slightly downward so the road is visible.
 
-    # FOE (cyan cross + rings)
-    fx = int(np.clip(foe_x, -w, 2 * w))
-    fy = int(np.clip(foe_y, -h, 2 * h))
-    for r in (10, 18):
-        cv2.circle(frame, (fx, fy), r, (0, 220, 220), 1, cv2.LINE_AA)
-    cv2.line(frame, (fx - 18, fy), (fx + 18, fy), (0, 220, 220), 1)
-    cv2.line(frame, (fx, fy - 18), (fx, fy + 18), (0, 220, 220), 1)
-    cv2.putText(frame, "FOE", (fx + 4, fy - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 220, 220), 1)
+    Returns
+    -------
+    rgb  : (H, W, 3) uint8  — RGB image
+    gray : (H, W)    uint8  — greyscale image
+    """
+    pos, orn = p.getBasePositionAndOrientation(car_id)
+    rot      = np.array(p.getMatrixFromQuaternion(orn)).reshape(3, 3)
 
-    # Goal projection (magenta)
-    if goal_img is not None:
-        cv2.circle(frame, goal_img, 9, (255, 60, 255), -1)
-        cv2.putText(frame, "GOAL", (goal_img[0] + 6, goal_img[1] - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 60, 255), 1)
+    # Camera position: 0.5 m ahead, 0.4 m up from car base in local frame
+    cam_local  = np.array([0.5, 0.0, 0.4])
+    cam_pos    = np.array(pos) + rot @ cam_local
 
-    # Attractive force arrow (blue)
-    sc = 180.0
-    cv2.arrowedLine(frame, (cx, cy),
-                    (int(cx + F_att[0]*sc), int(cy + F_att[1]*sc)),
-                    (255, 120, 0), 2, cv2.LINE_AA, tipLength=0.25)
+    # Look 3 m forward, 0.2 m down
+    look_local  = np.array([3.0, 0.0, -0.2])
+    look_target = np.array(pos) + rot @ look_local
+    up_vec      = (rot @ np.array([0.0, 0.0, 1.0])).tolist()
 
-    # Repulsive force arrow (red, reversed so it points away)
-    cv2.arrowedLine(frame, (cx, cy),
-                    (int(cx - F_rep[0]*sc), int(cy - F_rep[1]*sc)),
-                    (40, 40, 255), 2, cv2.LINE_AA, tipLength=0.25)
+    view_mat = p.computeViewMatrix(
+        cameraEyePosition    = cam_pos.tolist(),
+        cameraTargetPosition = look_target.tolist(),
+        cameraUpVector       = up_vec
+    )
+    proj_mat = p.computeProjectionMatrixFOV(
+        fov     = FOV_DEG,
+        aspect  = IMG_W / IMG_H,
+        nearVal = NEAR_CLIP,
+        farVal  = FAR_CLIP
+    )
 
-    # Boundary force arrow (orange) — only drawn when non-trivial
-    F_bnd_mag = np.linalg.norm(F_boundary)
-    if F_bnd_mag > 0.05:
-        cv2.arrowedLine(frame, (cx, cy),
-                        (int(cx + F_boundary[0]*sc*0.5),
-                         int(cy - F_boundary[1]*sc*0.5)),  # flip Y for screen
-                        (0, 165, 255), 2, cv2.LINE_AA, tipLength=0.25)
+    _, _, rgba, _, _ = p.getCameraImage(
+        width            = IMG_W,
+        height           = IMG_H,
+        viewMatrix       = view_mat,
+        projectionMatrix = proj_mat,
+        renderer         = p.ER_TINY_RENDERER
+    )
 
-    # HUD — colour-code boundary warning (red label when active)
-    bnd_col = (80, 80, 255) if F_bnd_mag > 0.1 else (255, 255, 255)
-    lines = [
-        (f"psi_d = {math.degrees(psi_d):+.1f} deg",  (255, 255, 255)),
-        (f"delta = {math.degrees(delta_f):+.1f} deg", (255, 255, 255)),
-        (f"speed = {speed:.2f} m/s",                  (255, 255, 255)),
-        (f"veh_y = {veh_y:+.3f} m",                  (255, 255, 255)),
-        (f"flows = {len(flows)}",                      (255, 255, 255)),
-        (f"|F_att|  = {np.linalg.norm(F_att):.3f}",  (255, 255, 255)),
-        (f"|F_rep|  = {np.linalg.norm(F_rep):.3f}",  (255, 255, 255)),
-        (f"|F_road| = {np.linalg.norm(F_road):.3f}", (255, 255, 255)),
-        (f"|F_bnd|  = {F_bnd_mag:.3f}",               bnd_col),
-        (f"|F_ctr|  = {np.linalg.norm(F_center):.3f}",(255, 255, 255)),
+    rgb  = np.array(rgba, dtype=np.uint8).reshape(IMG_H, IMG_W, 4)[:, :, :3]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    return rgb, gray
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PYBULLET CONTROL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_controls(car_id, steering_joints, motor_joints, delta_f, accel):
+    """
+    Map scalar steering angle and normalised acceleration to PyBullet joints.
+    """
+    for j in steering_joints:
+        p.setJointMotorControl2(
+            car_id, j,
+            p.POSITION_CONTROL,
+            targetPosition = float(delta_f),
+            force          = 10
+        )
+    target_vel = accel * 20.0        # m/s → rad/s (approximate wheel scaling)
+    for j in motor_joints:
+        p.setJointMotorControl2(
+            car_id, j,
+            p.VELOCITY_CONTROL,
+            targetVelocity = target_vel,
+            force          = MOTOR_FORCE
+        )
+
+
+def get_car_state(car_id):
+    """
+    Returns (x, y, yaw [rad], speed [m/s]).
+    """
+    pos, orn  = p.getBasePositionAndOrientation(car_id)
+    vel, _    = p.getBaseVelocity(car_id)
+    yaw       = p.getEulerFromQuaternion(orn)[2]
+    speed     = math.hypot(vel[0], vel[1])
+    return pos[0], pos[1], yaw, speed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VISUALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def draw_debug(rgb, pts, flows, valid, xFOE, yFOE, O_bin,
+               delta_f, speed, car_x, car_y):
+    """
+    Overlay optical flow arrows, FOE dot, obstacle mask, and HUD text
+    onto a copy of the camera frame.
+    """
+    vis = rgb.copy()
+
+    # Obstacle mask — semi-transparent red tint
+    tint = np.zeros_like(vis)
+    tint[O_bin > 0] = [220, 60, 60]
+    vis = cv2.addWeighted(vis, 0.80, tint, 0.20, 0)
+
+    # Flow vectors — green arrows
+    for i in range(len(pts)):
+        if not valid[i]:
+            continue
+        x0, y0 = int(pts[i, 0]), int(pts[i, 1])
+        x1 = int(x0 + flows[i, 0] * 4)
+        y1 = int(y0 + flows[i, 1] * 4)
+        cv2.arrowedLine(vis, (x0, y0), (x1, y1),
+                        (0, 230, 0), 1, tipLength=0.35)
+
+    # FOE — blue filled circle
+    fx = int(np.clip(xFOE, 2, IMG_W - 3))
+    fy = int(np.clip(yFOE, 2, IMG_H - 3))
+    cv2.circle(vis, (fx, fy), 9, (255, 60, 0), -1)
+    cv2.putText(vis, "FOE", (fx + 11, fy - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 60, 0), 1)
+
+    # HUD — yellow text
+    hud_lines = [
+        f"X  : {car_x:6.2f} m",
+        f"Y  : {car_y:6.3f} m",
+        f"v  : {speed:5.2f} m/s",
+        f"d  : {math.degrees(delta_f):+5.1f} deg",
+        f"pts: {int(valid.sum()):3d}",
+        f"FOE: ({xFOE:.0f}, {yFOE:.0f})",
     ]
-    for i, (txt, col) in enumerate(lines):
-        cv2.putText(frame, txt, (8, 18 + i * 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1)
+    for j, txt in enumerate(hud_lines):
+        cv2.putText(vis, txt, (8, 20 + j * 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 220), 1)
 
-    return frame
+    return vis
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 10.  MAIN NAVIGATION LOOP
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────────────────────────────────────
 
-class VisualNavigator:
-    """
-    Orchestrates the full pipeline each frame.
-    """
+def run():
+    # ── Initialise simulation ────────────────────────────────────────────────
+    car_id, steering_joints, motor_joints = setup_simulation(
+        dt=DT, settle_frames=60, gui=True
+    )
 
-    def __init__(self, gui: bool = True):
-        self.env  = SimulationEnvironment(gui=gui)
-        self.of   = SparseOpticalFlow(lk_win=25, lk_levels=3,
-                                       max_corners=200, quality=0.01,
-                                       min_dist=10)
-        self.vpf  = VisualPotentialField()
-        self.ctrl = GTSMC()
-        self._t0  = time.time()
+    flow_engine = SparseFlowEngine()
+    controller  = GTSMC()
 
-        # FIX-1: EMA state for psi_d smoothing (α = 0.25 → moderate lag)
-        self._PSI_D_ALPHA = 0.25
-        self._psi_d_filt  = 0.0   # filtered desired heading (initialised at 0)
+    # Grab first frame so we have a "previous" on the very first real step
+    _, gray_prev = get_camera_image(car_id)
+    p.stepSimulation()
+    time.sleep(DT)
 
-    def run(self, max_steps: int = 4000):
-        print("Visual Potential Field Navigation — press Q to quit.")
+    frame_idx = 0
+    print("\n[Controller] Running — press Q in the OpenCV window to stop.\n")
 
-        for step in range(max_steps):
+    while True:
+        frame_idx += 1
 
-            # ── Step 1 : Capture frame ────────────────────────────────────
-            frame_bgr, vm, pm = self.env.capture_frame()
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            h, w = gray.shape
+        # 1. Camera frame ─────────────────────────────────────────────────────
+        rgb, gray_curr = get_camera_image(car_id)
 
-            # ── Step 2 : Sparse optical flow  (Sec. III) ──────────────────
-            flows = self.of.compute(gray)
+        # 2. Sparse optical flow  (our LucasKanadeTracker) ────────────────────
+        pts, flows, valid = flow_engine.compute(gray_prev, gray_curr)
 
-            # ── Step 3 : FOE  (Sec. III-A, Eq. 1-3) ─────────────────────
-            foe_x, foe_y = compute_foe(flows, w, h)
+        # 3. FOE  (Eq. 1-2) ───────────────────────────────────────────────────
+        xFOE, yFOE = compute_foe(pts, flows, valid)
 
-            # ── Step 4 : TTC  (Sec. III-B, Eq. 3) ───────────────────────
-            ttcs = compute_ttc(flows, foe_x, foe_y)
+        # 4. TTC  (Eq. 3) ─────────────────────────────────────────────────────
+        ttc = compute_ttc(pts, flows, valid, xFOE, yFOE)
 
-            # ── Step 5 : Obstacle gradient  (Sec. III-C, Eq. 4-6) ────────
-            g_x, g_y = compute_obstacle_gradient(flows, h, w)
+        # 5. Obstacle gradient  (Eq. 4-6) ─────────────────────────────────────
+        gx, gy, O_bin = compute_obstacle_gradient(
+            pts, flows, valid, (IMG_H, IMG_W)
+        )
 
-            # ── Step 6 : Project goal into image ──────────────────────────
-            goal_img = self.env.project_to_image(self.env.goal_world, vm, pm)
+        # 6. Obstacle repulsive force  (Eq. 9) ────────────────────────────────
+        Frepx, Frepy = compute_obstacle_repulsive_force(gx, gy, pts, ttc, valid)
 
-            # ── Step 7 : Visual Potential Field forces  (Sec. IV) ─────────
-            F_att  = self.vpf.attractive_force(goal_img, w, h)
-            F_rep  = self.vpf.repulsive_force(g_x, g_y, ttcs, h, w)
+        # 7. Car state ────────────────────────────────────────────────────────
+        car_x, car_y, psi, speed = get_car_state(car_id)
 
-            state  = self.env.get_state()
-            veh_y  = float(state['pos'][1])
+        # 8. Attractive force  (Eq. 7-8) ──────────────────────────────────────
+        Fattx, Fatty = compute_attractive_force(car_x, car_y)
 
-            F_road     = self.vpf.road_force(
-                float(state['pos'][0]), veh_y, foe_x, w
+        # 9. Road repulsive force  (Eq. 10-18) ────────────────────────────────
+        FX_road, FY_road = compute_road_repulsive_force(
+            car_x, car_y, xFOE, IMG_W / 2.0
+        )
+
+        # 10. Total force → global frame  (Eq. 19-21) ─────────────────────────
+        FX0, FY0 = compute_total_force(
+            Fattx, Fatty,
+            Frepx, Frepy,
+            FX_road, FY_road,
+            psi
+        )
+
+        # 11. GTSMC steering + throttle  (Eq. 27-32) ──────────────────────────
+        delta_f, accel = controller.step(FX0, FY0, psi, speed, DT)
+
+        # 12. Apply to simulation ─────────────────────────────────────────────
+        apply_controls(car_id, steering_joints, motor_joints, delta_f, accel)
+
+        # 13. Step physics ────────────────────────────────────────────────────
+        p.stepSimulation()
+        time.sleep(DT)
+
+        # 14. Visualise ───────────────────────────────────────────────────────
+        vis = draw_debug(rgb, pts, flows, valid,
+                         xFOE, yFOE, O_bin,
+                         delta_f, speed, car_x, car_y)
+        cv2.imshow("Optical Flow  |  Visual Potential Field", vis)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("[Controller] User requested quit.")
+            break
+
+        # 15. Roll frames ─────────────────────────────────────────────────────
+        gray_prev = gray_curr.copy()
+
+        # 16. Goal reached? ───────────────────────────────────────────────────
+        if math.hypot(X_GOAL - car_x, Y_GOAL - car_y) < 1.0:
+            print(f"[Controller] Goal reached at frame {frame_idx}. Done.")
+            break
+
+        # 17. Periodic console log ────────────────────────────────────────────
+        if frame_idx % 60 == 0:
+            print(
+                f"  frame={frame_idx:5d}  "
+                f"x={car_x:6.2f}  y={car_y:+5.3f}  "
+                f"ψ={math.degrees(psi):+5.1f}°  "
+                f"v={speed:.2f} m/s  "
+                f"δ={math.degrees(delta_f):+5.1f}°  "
+                f"F=({FX0:+.3f}, {FY0:+.3f})  "
+                f"FOE=({xFOE:.0f}, {yFOE:.0f})  "
+                f"pts={int(valid.sum())}"
             )
-            # FIX-2: hard boundary repulsion (world frame)
-            F_boundary = self.vpf.boundary_force(veh_y)
-            # FIX-3: lane-centre restoring force (world frame)
-            F_center   = self.vpf.centering_force(veh_y)
 
-            # ── Step 8 : Desired heading  (Sec. V, Eq. 19-21, 27) ────────
-            psi_d_raw = compute_desired_heading(
-                F_att, F_rep, F_road, F_boundary, F_center, state['yaw']
-            )
-
-            # FIX-1: EMA low-pass on psi_d to suppress optical-flow noise
-            # Use angle-safe wrap so the EMA does not jump across ±π
-            dpsi = GTSMC._wrap(psi_d_raw - self._psi_d_filt)
-            self._psi_d_filt = GTSMC._wrap(
-                self._psi_d_filt + self._PSI_D_ALPHA * dpsi
-            )
-            psi_d = self._psi_d_filt
-
-            # ── Step 9 : GTSMC  (Sec. VI, Eq. 28-32) ────────────────────
-            now = time.time()
-            dt  = now - self._t0
-            self._t0 = now
-
-            delta_f, speed = self.ctrl.update(
-                state['yaw'], psi_d, state['speed'], dt
-            )
-
-            # ── Step 10 : Apply control to racecar joints  (Eq. 22-26) ───
-            self.env.apply_bicycle_control(delta_f, speed)
-            self.env.step()
-
-            # ── Step 11 : Visualise ───────────────────────────────────────
-            debug = draw_debug(
-                frame_bgr.copy(), flows,
-                foe_x, foe_y, goal_img,
-                F_att, F_rep, F_road, F_boundary, F_center,
-                psi_d, delta_f, speed, veh_y
-            )
-            cv2.imshow("Visual Potential Field Navigation", debug)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-            # ── Step 12 : Goal check ──────────────────────────────────────
-            dist = np.linalg.norm(state['pos'][:2] - self.env.goal_world[:2])
-            if dist < 1.5:
-                print(f"[Step {step}] Goal reached!  Dist = {dist:.2f} m")
-                break
-
-            if step % 60 == 0:
-                print(f"[Step {step:4d}] "
-                      f"pos=({state['pos'][0]:.1f},{veh_y:+.2f})  "
-                      f"psi={math.degrees(state['yaw']):+.1f}°  "
-                      f"psi_d={math.degrees(psi_d):+.1f}°  "
-                      f"delta={math.degrees(delta_f):+.1f}°  "
-                      f"v={speed:.2f} m/s  "
-                      f"goal_dist={dist:.1f} m  "
-                      f"|F_bnd|={np.linalg.norm(F_boundary):.2f}  "
-                      f"flows={len(flows)}")
-
-        cv2.destroyAllWindows()
-        self.env.disconnect()
-        print("Simulation ended.")
+    cv2.destroyAllWindows()
+    try:
+        p.disconnect()
+    except Exception:
+        pass
+    print("[Done]")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    nav = VisualNavigator(gui=True)
-    nav.run(max_steps=4000)
+    run()
