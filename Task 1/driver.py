@@ -3,12 +3,12 @@ visual_potential_field_nav.py
 
 Full implementation of:
     "Optical Flow based Visual Potential Field for Autonomous Driving"
-    Capito, Ozguner, Redmill – IEEE Intelligent Vehicles Symposium, 2020
+    Capito, Ozguner, Redmill - IEEE Intelligent Vehicles Symposium, 2020
 
 This version uses the author-supplied simulation_setup.py directly.
 The SimulationEnvironment class is now a thin adapter around the
 setup_simulation() helper provided by that module; all pipeline logic
-(Sections III – VI) is provided.
+(Sections III - VI) is provided.
 
 Behaviour improvements over the base implementation
 ────────────────────────────────────────────────────
@@ -244,7 +244,7 @@ class SparseOpticalFlow:
         self.quality     = quality
         self.min_dist    = min_dist
         self._prev_gray  = None
-        self._prev_pts   = None   # ndarray (N, 2) float32 – [x, y] pixel positions
+        self._prev_pts   = None   # ndarray (N, 2) float32 - [x, y] pixel positions
 
     # ── Corner detection ──────────────────────────────────────────────────────
     def _detect(self, gray: np.ndarray) -> np.ndarray:
@@ -328,14 +328,14 @@ def compute_foe(flows, img_w: int, img_h: int):
     Expanded (paper's explicit form):
         D    = Σa₀² · Σa₁² - (Σa₀a₁)²
         xFOE = (Σa₀b · Σa₁² - Σa₁b · Σa₀a₁) / D
-        yFOE = (−Σa₀b · Σa₀a₁ + Σa₁b · Σa₀²) / D
+        yFOE = (-Σa₀b · Σa₀a₁ + Σa₁b · Σa₀²) / D
     """
     if len(flows) < 4:
         return img_w / 2.0, img_h / 2.0
 
     a0 = np.array([ f[3]                   for f in flows], np.float64)  # vy
     a1 = np.array([-f[2]                   for f in flows], np.float64)  # -vx
-    b  = np.array([f[0]*f[3] - f[1]*f[2]  for f in flows], np.float64)  # x·vy − y·vx
+    b  = np.array([f[0]*f[3] - f[1]*f[2]  for f in flows], np.float64)  # x·vy - y·vx
 
     Sa0b = float(np.dot(a0, b))
     Sa1b = float(np.dot(a1, b))
@@ -358,7 +358,7 @@ def compute_foe(flows, img_w: int, img_h: int):
 
 def compute_ttc(flows, foe_x: float, foe_y: float):
     """
-    TTC_i = √[(x−xFOE)²+(y−yFOE)²] / √[vx²+vy²]   (Eq. 3)
+    TTC_i = √[(x-xFOE)²+(y-yFOE)²] / √[vx²+vy²]   (Eq. 3)
 
     Returns a list of TTC values in the same order as `flows`.
     Very slow flows get a large TTC (not a collision threat).
@@ -377,10 +377,10 @@ def compute_ttc(flows, foe_x: float, foe_y: float):
 
 def compute_obstacle_gradient(flows, img_h: int, img_w: int):
     """
-    Step 1 – Build a flow-magnitude image at tracked pixel positions.
-    Step 2 – Otsu threshold on that image → binary obstacle mask O(x,y,t).
-    Step 3 – Convolve O with a wide Gaussian G(x,y) with σ = img_w/2  (Eq. 4-5).
-    Step 4 – g(x,y,t) = ∇(G * O)  (Eq. 6), computed via Sobel on the blurred mask.
+    Step 1 - Build a flow-magnitude image at tracked pixel positions.
+    Step 2 - Otsu threshold on that image → binary obstacle mask O(x,y,t).
+    Step 3 - Convolve O with a wide Gaussian G(x,y) with σ = img_w/2  (Eq. 4-5).
+    Step 4 - g(x,y,t) = ∇(G * O)  (Eq. 6), computed via Sobel on the blurred mask.
 
     Returns (g_x, g_y) gradient arrays, each (img_h, img_w) float32.
     """
@@ -428,7 +428,7 @@ class VisualPotentialField:
       The author's simulation_setup.py builds a single narrow road
       (half-width = 1.16 m, lane markings at y = ±0.85 m).  To align
       the Morse potential boundaries with the actual markings the offsets
-      c0r / c0l are set to ±0.85 m here (paper Table I uses ±5.25/−8.75 m
+      c0r / c0l are set to ±0.85 m here (paper Table I uses ±5.25/-8.75 m
       for a 14 m wide, four-lane CARLA highway).  All other parameters and
       all equation logic are unchanged from the paper.
     """
@@ -445,9 +445,9 @@ class VisualPotentialField:
                  # ── FIX-2 : hard boundary parameters ──────────────────────
                  bnd_k     = 8.0,    # peak exponential gain at the wall
                  bnd_sigma = 0.18,   # exponential decay distance (m)
-                 bnd_onset = 0.55,   # distance from wall where force begins (m)
+                 bnd_onset = 0.30,   # distance from wall where force begins (m) - reduced for early activation
                  # ── FIX-3 : lane-centre restoring force ───────────────────
-                 ctr_k     = 0.25):  # proportional gain toward y = 0
+                 ctr_k     = 0.50):  # proportional gain toward y = 0 - increased for stronger centering
         self.alpha     = alpha
         self.gamma     = gamma
         self.road_A    = road_A
@@ -468,7 +468,7 @@ class VisualPotentialField:
         image centre to the projected goal pixel (Eq. 7).
 
         F_att = α · dist,   directed toward goal  (Eq. 8)
-        θ_goal = atan2(y_goal − y_ctr, x_goal − x_ctr)
+        θ_goal = atan2(y_goal - y_ctr, x_goal - x_ctr)
 
         If the goal is off-screen we return zero lateral bias (drive straight).
         """
@@ -524,7 +524,7 @@ class VisualPotentialField:
         The FOE image position (Sec. IV-C) decides straight vs curved:
           |foe_norm| < 0.15  → straight  (c2 = 0.005, n = 1)
           foe right          → curved right (c2 = +5e-6, n = 2)
-          foe left           → curved left  (c2 = −5e-6, n = 2)
+          foe left           → curved left  (c2 = -5e-6, n = 2)
 
         Returns gradient of (Usr + Usl) w.r.t. vehicle_y as (0, Fy).
         """
@@ -566,7 +566,7 @@ class VisualPotentialField:
             sgn = math.copysign(1.0, yy - yl)
             return A * (1.0 - math.exp(b * sgn * math.sqrt(max(r2, 1e-12)))) ** 2
 
-        # F_reprd = ∇(Usr + Usl)  (Eq. 18) – numerical derivative w.r.t. y
+        # F_reprd = ∇(Usr + Usl)  (Eq. 18) - numerical derivative w.r.t. y
         dy = 1e-3
         Fy = (_Usr(y + dy) + _Usl(y + dy) -
               _Usr(y - dy) - _Usl(y - dy)) / (2.0 * dy)
@@ -583,14 +583,14 @@ class VisualPotentialField:
         in compute_desired_heading so it always dominates near the edge.
 
         Sign convention (world Y-axis, positive = left):
-          Near RIGHT wall (veh_y → −1.16): Fy > 0  →  push left
+          Near RIGHT wall (veh_y → -1.16): Fy > 0  →  push left
           Near LEFT  wall (veh_y → +1.16): Fy < 0  →  push right
         """
-        ROAD_HW = 1.16   # road half-width (m) — matches simulation_setup.py
+        ROAD_HW = 1.16   # road half-width (m) - matches simulation_setup.py
         Fy = 0.0
 
         # Distance from each wall; positive means the car is still inside
-        dist_right = ROAD_HW + veh_y   # right wall at y = −1.16
+        dist_right = ROAD_HW + veh_y   # right wall at y = -1.16
         dist_left  = ROAD_HW - veh_y   # left  wall at y = +1.16
 
         # Right wall → push left (+Fy)
@@ -598,29 +598,39 @@ class VisualPotentialField:
             d = max(dist_right, 1e-4)
             Fy += self.bnd_k * math.exp(-d / self.bnd_sigma)
 
-        # Left wall → push right (−Fy)
+        # Left wall → push right (-Fy)
         if dist_left < self.bnd_onset:
             d = max(dist_left, 1e-4)
             Fy -= self.bnd_k * math.exp(-d / self.bnd_sigma)
 
         return np.array([0.0, Fy])
 
-    # ── FIX-3 : Lane-centre restoring force ───────────────────────────────────
-    def centering_force(self, veh_y: float) -> np.ndarray:
+    # ── FIX-3 : Lane-centre restoring force (adaptive) ────────────────────────
+    def centering_force(self, veh_y: float, rep_mag: float = 0.0) -> np.ndarray:
         """
-        Gentle proportional attraction toward the lane centre (y = 0).
+        Proportional attraction toward the lane centre (y = 0), with gain
+        that adapts to whether an obstacle is actively being avoided.
 
-        Active at all times but kept deliberately weak (ctr_k = 0.25) so
-        it does not fight active obstacle repulsion.  Once the car has
-        cleared an obstacle the centering bias is the dominant lateral
-        force and smoothly returns the car to y = 0 ready for the next
-        manoeuvre.
+        When rep_mag is large (obstacle present):
+            effective_k ≈ ctr_k  (moderate - don't fight the avoidance)
 
-        Sign convention: Fy = −ctr_k · y
-          y > 0 (left of centre)  → Fy < 0  → push right toward centre
-          y < 0 (right of centre) → Fy > 0  → push left  toward centre
+        When rep_mag is small (open road):
+            effective_k ≈ ctr_k * (1 + boost) = up to 3x stronger
+            -> car is pulled firmly back to y = 0 between obstacles.
+
+        This is the key to recentring: once the car clears an obstacle and
+        F_rep drops, centering suddenly dominates and smoothly steers back
+        to centre BEFORE the next obstacle is encountered.
+
+        Sign convention: Fy = -effective_k * y
+          y > 0 (left of centre)  -> Fy < 0  -> push right toward centre
+          y < 0 (right of centre) -> Fy > 0  -> push left  toward centre
         """
-        return np.array([0.0, -self.ctr_k * veh_y])
+        # boost decays from 2.0 to 0 as rep_mag rises above ~0.005
+        # (rep_mag approx 0 on open road; rep_mag grows to ~0.02-0.08 near obstacle)
+        boost        = 2.0 * math.exp(-rep_mag / 0.006)
+        effective_k  = self.ctr_k * (1.0 + boost)
+        return np.array([0.0, -effective_k * veh_y])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -636,13 +646,13 @@ def compute_desired_heading(F_att     : np.ndarray,
                              lam_X     : float = 0.15,
                              lam_Y     : float = 0.15,
                              lam_bnd   : float = 1.20,
-                             lam_ctr   : float = 0.60) -> float:
+                             lam_ctr   : float = 1.00) -> float:
     """
     Combine image-plane and motion-plane forces into a global desired heading.
 
     Image-plane total force  (Eq. 19-20, extended with FIX-2 and FIX-3):
-        F_XT = F_att_x − F_rep_x − λX · FX_road
-        F_YT = F_att_y − F_rep_y − λY · FY_road
+        F_XT = F_att_x - F_rep_x - λX · FX_road
+        F_YT = F_att_y - F_rep_y - λY · FY_road
                        + λ_bnd · F_boundary_Y      (FIX-2: ADDED, not subtracted)
                        + λ_ctr · F_center_Y         (FIX-3: ADDED, not subtracted)
 
@@ -651,7 +661,7 @@ def compute_desired_heading(F_att     : np.ndarray,
       • F_boundary_Y > 0 when near the right wall → should increase F_YT
         (more leftward total force → turn left away from wall).  If it
         were subtracted like F_road it would do the opposite.
-      • F_center_Y = −ctr_k·y, so when y < 0 (right of centre)
+      • F_center_Y = -ctr_k·y, so when y < 0 (right of centre)
         F_center_Y > 0 → ADDED → positive F_YT contribution → turns left
         back toward centre.  Correct.
 
@@ -660,7 +670,7 @@ def compute_desired_heading(F_att     : np.ndarray,
 
     Rotate to global frame  (Eq. 21):
         [F_X']   [ cos ψ   sin ψ ] [F_XT]
-        [F_Y'] = [−sin ψ   cos ψ ] [F_YT]
+        [F_Y'] = [-sin ψ   cos ψ ] [F_YT]
 
     Desired heading  (Eq. 27):
         ψ_d = atan2(F_Y', F_X')
@@ -682,7 +692,7 @@ def compute_desired_heading(F_att     : np.ndarray,
     F_Yp  = -sp * F_XT + cp * F_YT
 
     if abs(F_Xp) < 1e-8 and abs(F_Yp) < 1e-8:
-        return psi   # degenerate – hold current heading
+        return psi   # degenerate - hold current heading
 
     return math.atan2(F_Yp, F_Xp)
 
@@ -694,14 +704,14 @@ def compute_desired_heading(F_att     : np.ndarray,
 class GTSMC:
     """
     Lateral controller  (Eq. 28-30):
-        ψ_e       = ψ(t) − ψ_d(p)
+        ψ_e       = ψ(t) - ψ_d(p)
         s_r       = c_r · ψ_e + ψ̇_e          (rotational sliding manifold)
-        u         = −u₀ · sign(s_r)
+        u         = -u₀ · sign(s_r)
         δ̇_f       = u   →   δ_f += u · Δt
 
     Longitudinal controller  (Eq. 31-32):
-        s_l       = c_l · v − v_d             (longitudinal sliding manifold)
-        a         = −a₀ · sign(s_l)
+        s_l       = c_l · v - v_d             (longitudinal sliding manifold)
+        a         = -a₀ · sign(s_l)
         v        += a · Δt
 
     FIX-1 changes vs. base:
@@ -717,7 +727,7 @@ class GTSMC:
 
     def __init__(self,
                  cr        = 3.5,                   # FIX-1: raised from 2.5
-                 u0        = 0.40,                  # FIX-1: lowered from 1.0
+                 u0        = 0.22,                  # FIX-1: reduced further to prevent oversteering
                  cl        = 1.0,
                  a0        = 1.5,
                  v_ref     = 5.55,                  # ~20 km/h  (Table II)
@@ -736,7 +746,7 @@ class GTSMC:
 
     @staticmethod
     def _wrap(a: float) -> float:
-        """Wrap angle to (−π, π]."""
+        """Wrap angle to (-π, π]."""
         return (a + math.pi) % (2.0 * math.pi) - math.pi
 
     def update(self, psi: float, psi_d: float,
@@ -818,7 +828,7 @@ def draw_debug(frame, flows, foe_x, foe_y, goal_img,
                     (int(cx - F_rep[0]*sc), int(cy - F_rep[1]*sc)),
                     (40, 40, 255), 2, cv2.LINE_AA, tipLength=0.25)
 
-    # Boundary force arrow (orange) — only drawn when non-trivial
+    # Boundary force arrow (orange) - only drawn when non-trivial
     F_bnd_mag = np.linalg.norm(F_boundary)
     if F_bnd_mag > 0.05:
         cv2.arrowedLine(frame, (cx, cy),
@@ -826,7 +836,7 @@ def draw_debug(frame, flows, foe_x, foe_y, goal_img,
                          int(cy - F_boundary[1]*sc*0.5)),  # flip Y for screen
                         (0, 165, 255), 2, cv2.LINE_AA, tipLength=0.25)
 
-    # HUD — colour-code boundary warning (red label when active)
+    # HUD - colour-code boundary warning (red label when active)
     bnd_col = (80, 80, 255) if F_bnd_mag > 0.1 else (255, 255, 255)
     lines = [
         (f"psi_d = {math.degrees(psi_d):+.1f} deg",  (255, 255, 255)),
@@ -870,7 +880,7 @@ class VisualNavigator:
         self._psi_d_filt  = 0.0   # filtered desired heading (initialised at 0)
 
     def run(self, max_steps: int = 4000):
-        print("Visual Potential Field Navigation — press Q to quit.")
+        print("Visual Potential Field Navigation - press Q to quit.")
 
         for step in range(max_steps):
 
